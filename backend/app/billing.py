@@ -29,10 +29,14 @@ class ChargeRules:
 RULES = ChargeRules()
 
 
-def monthly_charge(membership: str, age: int) -> int:
-    """회원의 월 부과액 (가입여부/연령 기반)."""
+def monthly_charge(membership: str, age: int | None = None, birth_year: int | None = None) -> int:
+    """회원의 월 부과액 (가입여부/연령 기반).
+    age가 없으면 일반 협회비 기준으로 처리하고, 추후 생년/주민번호 반영 시 70세 감면 계산.
+    """
     if membership == "협회가입":
-        return RULES.협회비_70세 if age >= 70 else RULES.협회비
+        if age is not None and age >= 70:
+            return RULES.협회비_70세
+        return RULES.협회비
     return RULES.관리비
 
 
@@ -58,3 +62,12 @@ def ym_label(year: int, month: int) -> str:
 def months_between(y1: int, m1: int, y2: int, m2: int) -> int:
     """두 연월 사이 개월 수(양끝 포함)."""
     return (y2 - y1) * 12 + (m2 - m1) + 1
+
+
+def next_month_ym(d) -> str | None:
+    """date/datetime 값을 받아 다음 달 YYYY-MM 반환."""
+    if d is None:
+        return None
+    y, m = d.year, d.month
+    ny, nm = next_month(y, m)
+    return ym_key(ny, nm)

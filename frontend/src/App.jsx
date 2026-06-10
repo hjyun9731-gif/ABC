@@ -9,6 +9,7 @@ import ClosureBoard from './screens/ClosureBoard.jsx'
 import Roster from './screens/Roster.jsx'
 import PaymentsHistory from './screens/PaymentsHistory.jsx'
 import PendingBoard from './screens/PendingBoard.jsx'
+import ExcelImport from './screens/ExcelImport.jsx'
 
 const NAV = [
   { key: 'dashboard', label: '대시보드' },
@@ -18,6 +19,7 @@ const NAV = [
   { key: 'roster', label: '전체자명단' },
   { key: 'payments', label: '수납내역' },
   { key: 'pending', label: '신규 · 예정자' },
+  { key: 'import', label: '엑셀 업로드' },
 ]
 
 export default function App() {
@@ -26,8 +28,24 @@ export default function App() {
   const [preset, setPreset] = useState(null)
   const [data, setData] = useState(() => buildInitialData())
 
+  async function reloadFromDb(){
+    try{
+      const members = await api.listMembers({size: 5000})
+      if(Array.isArray(members) && members.length){
+        setData(d => ({...d, members, closures: d.closures, payments: d.payments}))
+        setHealth('연결됨 · 실제 DB 데이터 표시 중')
+        return true
+      }
+      setHealth('연결됨 · DB 데이터 없음, 샘플데이터 표시 중')
+      return false
+    }catch(e){
+      setHealth('백엔드 미연결 · 화면은 샘플데이터로 동작')
+      return false
+    }
+  }
+
   useEffect(() => {
-    api.health().then((d) => setHealth(`연결됨 (${d.app})`)).catch(() => setHealth('백엔드 미연결 · 화면은 샘플데이터로 동작'))
+    api.health().then((d) => { setHealth(`연결됨 (${d.app})`); reloadFromDb() }).catch(() => setHealth('백엔드 미연결 · 화면은 샘플데이터로 동작'))
   }, [])
 
   const summary = useMemo(() => {
@@ -94,15 +112,15 @@ export default function App() {
   function excludeDeposit(depositId){ setData(d=>({...d, deposits:d.deposits.map(x=>x.id===depositId?{...x,status:'제외'}:x)})) }
   function addPending(payload){ setData(d=>({...d,pending:[{...payload,id:'NNEW'+Date.now(),step:'예정자 등록',note:payload.note||''},...d.pending]})) }
 
-  const screenProps = {data, summary, navigate, preset, setPreset, saveMemo, applyPayment, registerClosure, matchDeposit, excludeDeposit, addPending}
-  const Screen = {dashboard:Dashboard,list:ReceivablesList,bank:BankMatching,closure:ClosureBoard,roster:Roster,payments:PaymentsHistory,pending:PendingBoard}[view]
+  const screenProps = {data, summary, navigate, preset, setPreset, saveMemo, applyPayment, registerClosure, matchDeposit, excludeDeposit, addPending, reloadFromDb}
+  const Screen = {dashboard:Dashboard,list:ReceivablesList,bank:BankMatching,closure:ClosureBoard,roster:Roster,payments:PaymentsHistory,pending:PendingBoard,import:ExcelImport}[view]
 
   return <div className="app">
     <aside className="sidebar">
       <div className="brand">미수금관리</div>
       <div className="brand-sub">강원 개인소형화물협회</div>
       <nav>{NAV.map(n=><button key={n.key} onClick={()=>navigate(n.key)} className={'nav-btn '+(view===n.key?'active':'')}>{n.label}{n.main?' · MAIN':''}</button>)}</nav>
-      <div className="health">백엔드: {health}<br/>현재 화면: 샘플데이터 기반<br/>실제 DB/API 연결 전 업무흐름 검증용</div>
+      <div className="health">백엔드: {health}<br/>엑셀 업로드 후 실제 DB 데이터로 전환됨<br/>데이터 없을 때만 샘플 표시</div>
     </aside>
     <main className="main"><Screen {...screenProps}/></main>
   </div>

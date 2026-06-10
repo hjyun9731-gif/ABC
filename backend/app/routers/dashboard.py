@@ -1,23 +1,31 @@
-"""대시보드 라우터 — 집계 요약. (집계 로직은 다음 단계에서 채움)"""
+"""대시보드 라우터 — DB 기준 집계."""
+
+from datetime import date
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import Closure, Member
-from ..schemas import DashboardSummary
+from ..models import Closure, Member, Payment, ReceivableItem
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 
-@router.get("/summary", response_model=DashboardSummary)
+@router.get("/summary")
 def summary(db: Session = Depends(get_db)):
     total_members = db.scalar(select(func.count()).select_from(Member)) or 0
     closure_count = db.scalar(select(func.count()).select_from(Closure)) or 0
-    # arrears_members / total_arrears_amount / month_payment 는
-    # receivable_items · payments 집계로 다음 단계에서 계산한다.
-    return DashboardSummary(
-        total_members=total_members,
-        closure_count=closure_count,
-    )
+    active_members = db.scalar(select(func.count()).select_from(Member).where(Member.status == "정상")) or 0
+    total_arrears_amount = db.scalar(select(func.coalesce(func.sum(ReceivableItem.amount), 0)).where(ReceivableItem.is_paid == False)) or 0
+    arrears_members = db.scalar(select(func.count(func.distinct(ReceivableItem.member_id))).where(ReceivableItem.is_paid == False)) or 0
+    ym = date.today().strftime("%Y-%m")
+    month_payment = db.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(func.to_char(Payment.paid_date, "YYYY-MM") == ym)) or 0
+    return {
+        "total_members": total_members,
+        "active_members": active_members,
+        "arrears_members": arrears_members,
+        "total_arrears_amount": total_arrears_amount,
+        "month_payment": month_payment,
+        "closure_count": closure_count,
+    }
