@@ -247,17 +247,92 @@ def _normalize_sheet(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _read_excel(file: UploadFile) -> tuple[str, list[dict[str, Any]]]:
+def _read_excel(file: UploadFile, max_rows: int | None = None) -> tuple[str, list[dict[str, Any]]]:
+    """엑셀을 최대한 안전하게 읽는다.
+
+    기존 pandas 전체시트 로딩은 큰 xlsm 파일에서 Railway 메모리/시간 문제로 502가 날 수 있어
+    xlsx/xlsm은 openpyxl read_only 스트리밍 방식으로 읽는다.
+    """
     content = file.file.read()
     if not content:
         raise HTTPException(status_code=400, detail="파일 내용이 비어 있습니다.")
     name = file.filename or "upload.xlsx"
     suffix = Path(name).suffix.lower()
+
+    if suffix in {".xlsx", ".xlsm"}:
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            rows_out: list[dict[str, Any]] = []
+            best_sheet_message = ""
+
+            for ws in wb.worksheets:
+                raw_rows_iter = ws.iter_rows(values_only=True)
+                buffer: list[list[Any]] = []
+                # 헤더 탐지를 위해 앞 40행만 먼저 확인
+                for _ in range(40):
+                    try:
+                        vals = list(next(raw_rows_iter))
+                    except StopIteration:
+                        break
+                    if any(_clean(v) for v in vals):
+                        buffer.append(vals)
+
+                if not buffer:
+                    continue
+
+                best_idx = None
+                best_score = 0
+                for i, vals in enumerate(buffer[:30]):
+                    score = _header_score(vals)
+                    if score > best_score:
+                        best_score = score
+                        best_idx = i
+
+                if best_idx is None or best_score < 2:
+                    best_sheet_message = best_sheet_message or f"{ws.title} 시트에서 업무용 헤더를 찾지 못했습니다."
+                    continue
+
+                cols = _make_unique_columns(buffer[best_idx])
+
+                def emit(vals: list[Any]):
+                    # 완전 빈 행은 제외
+                    if not any(_clean(v) for v in vals):
+                        return
+                    # 열 개수 차이 보정
+                    fixed = list(vals[:len(cols)]) + [""] * max(0, len(cols) - len(vals))
+                    row = {cols[i]: _json_safe(fixed[i]) for i in range(len(cols))}
+                    row["__sheet"] = ws.title
+                    rows_out.append(row)
+
+                # 버퍼 중 헤더 이후 데이터
+                for vals in buffer[best_idx + 1:]:
+                    emit(vals)
+                    if max_rows and len(rows_out) >= max_rows:
+                        return name, rows_out
+
+                # 나머지 데이터 스트리밍
+                for vals in raw_rows_iter:
+                    emit(list(vals))
+                    if max_rows and len(rows_out) >= max_rows:
+                        return name, rows_out
+
+                # 첫 유효 시트에서 데이터가 나오면 preview/commit 모두 계속 읽되,
+                # 너무 많은 시트 오탐을 줄이기 위해 다음 시트도 헤더가 있을 때만 추가된다.
+
+            if not rows_out and best_sheet_message:
+                raise HTTPException(status_code=400, detail=best_sheet_message)
+            return name, rows_out
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"엑셀 읽기 실패: {type(exc).__name__}: {exc}") from exc
+
+    # xls/csv는 pandas fallback. 단, preview에서는 nrows로 가볍게 읽는다.
     try:
-        frames = []
-        if suffix in {".xlsx", ".xlsm", ".xls"}:
-            # header=None으로 먼저 읽어야 제목줄/병합셀 있는 관공서 엑셀도 안전하게 처리됨
-            sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, dtype=object, header=None)
+        if suffix == ".xls":
+            sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, dtype=object, header=None, nrows=max_rows)
+            frames = []
             for sheet, raw in sheets.items():
                 df = _normalize_sheet(raw)
                 if df.empty:
@@ -268,14 +343,13 @@ def _read_excel(file: UploadFile) -> tuple[str, list[dict[str, Any]]]:
                 return name, []
             df = pd.concat(frames, ignore_index=True)
         elif suffix == ".csv":
-            df = pd.read_csv(io.BytesIO(content), dtype=object, encoding="utf-8-sig")
+            df = pd.read_csv(io.BytesIO(content), dtype=object, encoding="utf-8-sig", nrows=max_rows)
             df = df.dropna(how="all")
         else:
             raise HTTPException(status_code=400, detail="xlsx/xlsm/xls/csv 파일만 업로드할 수 있습니다.")
     except HTTPException:
         raise
     except Exception as exc:
-        # 서버 500 대신 화면에 읽기 실패 이유가 보이도록 400으로 반환
         raise HTTPException(status_code=400, detail=f"엑셀 읽기 실패: {type(exc).__name__}: {exc}") from exc
     df = df.rename(columns={c: str(c).strip() for c in df.columns})
     df = df.fillna("")
@@ -340,9 +414,9 @@ def _find_member(db: Session, name: str, vehicle: str) -> Member | None:
 
 @router.post("/preview")
 def preview_import(file_type: str = Form(...), file: UploadFile = File(...)):
-    filename, rows = _read_excel(file)
+    filename, rows = _read_excel(file, max_rows=300)
     if not rows:
-        return {"filename": filename, "file_type": file_type, "total_rows": 0, "columns": [], "sample": []}
+        return {"filename": filename, "file_type": file_type, "total_rows": 0, "columns": [], "sample": [], "message": "읽을 수 있는 데이터 행이 없습니다. 시트/헤더를 확인해 주세요."}
     columns = [c for c in rows[0].keys() if not c.startswith("__")]
     return {
         "filename": filename,
