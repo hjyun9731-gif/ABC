@@ -31,15 +31,15 @@ SIGUN = [
     "양구군", "인제군", "고성군", "양양군",
 ]
 
-NAME_KEYS = ["성명", "이름", "대표자", "회원명", "사업자명"]
-VEHICLE_KEYS = ["차량번호", "차량 번호", "차량", "자동차등록번호", "등록번호"]
+NAME_KEYS = ["성명", "이름", "대표자", "대표자명", "회원명", "사업자명", "성명(대표자)", "성명대표자"]
+VEHICLE_KEYS = ["차량번호", "차량 번호", "차량", "차량등록번호", "자동차등록번호", "자동차 등록번호", "등록번호", "차량No", "차량NO"]
 PHONE_KEYS = ["휴대폰", "핸드폰", "전화번호", "연락처", "휴대전화", "휴대폰번호"]
 REGION_KEYS = ["지역", "시군", "관할", "주소", "공문주소", "주소지", "사용본거지"]
 MGMT_KEYS = ["관리번호", "관리 번호"]
 MEMBER_TYPE_KEYS = ["회원구분", "구분", "개인택배", "업종"]
 JOIN_KEYS = ["협회가입일", "가입일", "가입일자", "협회 가입일"]
 CERT_KEYS = ["자격증명발급일", "자격증명 발급일", "자격증명발급일자", "발급일", "발급일자"]
-AMOUNT_KEYS = ["미수금", "미납금액", "미납액", "합계", "총액", "금액", "미수금액"]
+AMOUNT_KEYS = ["미수금", "미납금액", "미납액", "미납", "합계", "총액", "금액", "미수금액", "잔액"]
 DEPOSIT_NAME_KEYS = ["입금자명", "입금자", "예금주", "거래기록사항", "내용"]
 DEPOSIT_DATE_KEYS = ["입금일", "거래일", "일자", "거래일자", "날짜"]
 DEPOSIT_AMOUNT_KEYS = ["입금액", "입금", "금액", "거래금액"]
@@ -145,6 +145,108 @@ def _membership(row: dict[str, Any], columns: list[str]) -> str:
     return "협회미가입"
 
 
+
+def _json_safe(v: Any) -> Any:
+    """FastAPI가 pandas/엑셀 값을 JSON으로 변환하다 500 나는 문제 방지."""
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    # pandas Timestamp / numpy scalar 대응
+    if hasattr(v, "isoformat") and "Timestamp" in type(v).__name__:
+        try:
+            return v.isoformat()
+        except Exception:
+            return str(v)
+    if hasattr(v, "item"):
+        try:
+            return v.item()
+        except Exception:
+            pass
+    return v
+
+
+def _json_safe_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {str(k): _json_safe(v) for k, v in row.items()}
+
+
+def _make_unique_columns(values: list[Any]) -> list[str]:
+    seen: dict[str, int] = {}
+    cols: list[str] = []
+    for i, v in enumerate(values, start=1):
+        name = _clean(v) or f"컬럼{i}"
+        # 엑셀의 Unnamed 컬럼/빈 컬럼 정리
+        if name.lower().startswith("unnamed"):
+            name = f"컬럼{i}"
+        base = name
+        if base in seen:
+            seen[base] += 1
+            name = f"{base}_{seen[base]}"
+        else:
+            seen[base] = 1
+        cols.append(name)
+    return cols
+
+
+def _header_score(values: list[Any]) -> int:
+    joined_cells = [_norm_col(v) for v in values if _clean(v)]
+    if not joined_cells:
+        return 0
+    candidates = (
+        NAME_KEYS + VEHICLE_KEYS + PHONE_KEYS + REGION_KEYS + MGMT_KEYS + MEMBER_TYPE_KEYS +
+        JOIN_KEYS + CERT_KEYS + AMOUNT_KEYS + DEPOSIT_NAME_KEYS + DEPOSIT_DATE_KEYS + DEPOSIT_AMOUNT_KEYS
+    )
+    score = 0
+    for cell in joined_cells:
+        for key in candidates:
+            nk = _norm_col(key)
+            if nk and (nk == cell or nk in cell or cell in nk):
+                score += 1
+                break
+    return score
+
+
+def _normalize_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    """헤더가 1행이 아닌 협회 엑셀도 읽도록 헤더 행 자동 탐지."""
+    df = df.dropna(how="all")
+    if df.empty:
+        return df
+    # 좌우가 전부 빈 컬럼 제거
+    df = df.dropna(axis=1, how="all")
+    if df.empty:
+        return df
+
+    # 상단 30행 중 이름/차량번호/금액 같은 업무 컬럼명이 가장 많이 들어있는 행을 헤더로 사용
+    best_idx = None
+    best_score = 0
+    max_scan = min(len(df), 30)
+    for i in range(max_scan):
+        vals = list(df.iloc[i].values)
+        score = _header_score(vals)
+        if score > best_score:
+            best_score = score
+            best_idx = i
+    if best_idx is not None and best_score >= 2:
+        cols = _make_unique_columns(list(df.iloc[best_idx].values))
+        out = df.iloc[best_idx + 1:].copy()
+        out.columns = cols
+    else:
+        # 그래도 못 찾으면 기존 방식처럼 첫 행을 컬럼으로 간주
+        cols = _make_unique_columns(list(df.iloc[0].values))
+        out = df.iloc[1:].copy()
+        out.columns = cols
+
+    out = out.dropna(how="all")
+    # 완전 빈 행 제거
+    out = out.loc[:, [c for c in out.columns if not str(c).startswith("컬럼") or out[c].astype(str).str.strip().ne("").any()]]
+    return out
+
+
 def _read_excel(file: UploadFile) -> tuple[str, list[dict[str, Any]]]:
     content = file.file.read()
     if not content:
@@ -152,11 +254,12 @@ def _read_excel(file: UploadFile) -> tuple[str, list[dict[str, Any]]]:
     name = file.filename or "upload.xlsx"
     suffix = Path(name).suffix.lower()
     try:
+        frames = []
         if suffix in {".xlsx", ".xlsm", ".xls"}:
-            sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, dtype=object)
-            frames = []
-            for sheet, df in sheets.items():
-                df = df.dropna(how="all")
+            # header=None으로 먼저 읽어야 제목줄/병합셀 있는 관공서 엑셀도 안전하게 처리됨
+            sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, dtype=object, header=None)
+            for sheet, raw in sheets.items():
+                df = _normalize_sheet(raw)
                 if df.empty:
                     continue
                 df["__sheet"] = sheet
@@ -166,15 +269,17 @@ def _read_excel(file: UploadFile) -> tuple[str, list[dict[str, Any]]]:
             df = pd.concat(frames, ignore_index=True)
         elif suffix == ".csv":
             df = pd.read_csv(io.BytesIO(content), dtype=object, encoding="utf-8-sig")
+            df = df.dropna(how="all")
         else:
             raise HTTPException(status_code=400, detail="xlsx/xlsm/xls/csv 파일만 업로드할 수 있습니다.")
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"엑셀 읽기 실패: {exc}") from exc
+        # 서버 500 대신 화면에 읽기 실패 이유가 보이도록 400으로 반환
+        raise HTTPException(status_code=400, detail=f"엑셀 읽기 실패: {type(exc).__name__}: {exc}") from exc
     df = df.rename(columns={c: str(c).strip() for c in df.columns})
-    return name, df.fillna("").to_dict(orient="records")
-
+    df = df.fillna("")
+    return name, [_json_safe_row(r) for r in df.to_dict(orient="records")]
 
 def _member_payload(row: dict[str, Any], index: int, columns: list[str], db: Session) -> dict[str, Any] | None:
     name_col = _find_col(columns, NAME_KEYS)
