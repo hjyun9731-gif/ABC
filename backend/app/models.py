@@ -34,7 +34,7 @@ from .database import Base
 
 
 class Member(Base):
-    __tablename__ = "members"
+    __tablename__ = "misu_members"
 
     id: Mapped[str] = mapped_column(String(16), primary_key=True)        # 'M00001'
     mgmt_no: Mapped[str] = mapped_column(String(16), unique=True, index=True)  # 관리번호
@@ -70,11 +70,11 @@ class Member(Base):
 
 
 class ReceivableItem(Base):
-    __tablename__ = "receivable_items"
-    __table_args__ = (UniqueConstraint("member_id", "ym", name="uq_receivable_member_ym"),)
+    __tablename__ = "misu_receivable_items"
+    __table_args__ = (UniqueConstraint("member_id", "ym", name="uq_misu_receivable_member_ym"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    member_id: Mapped[str] = mapped_column(ForeignKey("members.id"), index=True)
+    member_id: Mapped[str] = mapped_column(ForeignKey("misu_members.id"), index=True)
     ym: Mapped[str] = mapped_column(String(7))            # 'YYYY-MM'
     charge_item: Mapped[str] = mapped_column(String(8))
     amount: Mapped[int] = mapped_column(Integer)
@@ -85,17 +85,17 @@ class ReceivableItem(Base):
 
 
 class Payment(Base):
-    __tablename__ = "payments"
+    __tablename__ = "misu_payments"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    member_id: Mapped[str] = mapped_column(ForeignKey("members.id"), index=True)
+    member_id: Mapped[str] = mapped_column(ForeignKey("misu_members.id"), index=True)
     paid_for_ym: Mapped[str] = mapped_column(String(7))   # 어느 달 분 납부인지
     charge_item: Mapped[str] = mapped_column(String(8))
     amount: Mapped[int] = mapped_column(Integer)
     method: Mapped[str] = mapped_column(String(12))       # 통장매칭/현금/CMS
     paid_date: Mapped[date] = mapped_column(Date)
     deposit_id: Mapped[int | None] = mapped_column(
-        ForeignKey("deposits.id"), nullable=True, index=True
+        ForeignKey("misu_deposits.id"), nullable=True, index=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -104,7 +104,7 @@ class Payment(Base):
 
 
 class Deposit(Base):
-    __tablename__ = "deposits"
+    __tablename__ = "misu_deposits"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     deposit_date: Mapped[date] = mapped_column(Date, index=True)   # 일자
@@ -114,7 +114,7 @@ class Deposit(Base):
     status: Mapped[str] = mapped_column(String(8), default="대기", index=True)
     # 상태: 대기/매칭완료/중복/미매칭/제외/확인필요
     matched_member_id: Mapped[str | None] = mapped_column(
-        ForeignKey("members.id"), nullable=True
+        ForeignKey("misu_members.id"), nullable=True
     )
     is_excluded: Mapped[bool] = mapped_column(Boolean, default=False)
     hint: Mapped[str | None] = mapped_column(String(80), nullable=True)
@@ -124,10 +124,10 @@ class Deposit(Base):
 
 
 class Closure(Base):
-    __tablename__ = "closures"
+    __tablename__ = "misu_closures"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    member_id: Mapped[str] = mapped_column(ForeignKey("members.id"), index=True)
+    member_id: Mapped[str] = mapped_column(ForeignKey("misu_members.id"), index=True)
     type: Mapped[str] = mapped_column(String(8))          # 폐업/양도/이관/탈퇴
     process_date: Mapped[date] = mapped_column(Date)      # 처리일
     doc_no: Mapped[str | None] = mapped_column(String(40), nullable=True)  # 공문번호
@@ -140,7 +140,7 @@ class Closure(Base):
 
 
 class Pending(Base):
-    __tablename__ = "pending"
+    __tablename__ = "misu_pending"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(40))
@@ -158,16 +158,16 @@ class Pending(Base):
     expected_charge: Mapped[str | None] = mapped_column(String(8), nullable=True)  # 예상부과
     note: Mapped[str | None] = mapped_column(String(60), nullable=True)            # 비고
     promoted_member_id: Mapped[str | None] = mapped_column(
-        ForeignKey("members.id"), nullable=True
+        ForeignKey("misu_members.id"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class MemberHistory(Base):
-    __tablename__ = "member_history"
+    __tablename__ = "misu_member_history"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    member_id: Mapped[str] = mapped_column(ForeignKey("members.id"), index=True)
+    member_id: Mapped[str] = mapped_column(ForeignKey("misu_members.id"), index=True)
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     content: Mapped[str] = mapped_column(Text)
     actor: Mapped[str | None] = mapped_column(String(40), nullable=True)
