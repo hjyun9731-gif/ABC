@@ -1,0 +1,16 @@
+# 로컬 개발용 PostgreSQL (선택)
+# 사용: docker compose up -d
+#   → backend/.env 에 DATABASE_URL=postgresql://misu:misu@localhost:5432/misu
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: misu
+      POSTGRES_PASSWORD: misu
+      POSTGRES_DB: misu
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # 데이터 영속(삭제하지 않음)
+volumes:
+  pgdata:

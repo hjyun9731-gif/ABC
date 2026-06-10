@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Node / 빌드 산출물
+node_modules/
+frontend/dist/
+backend/app/static/
+
+# 환경/비밀
+.env
+.env.*
+!.env.example
+
+# 로컬 DB / 덤프 (실데이터·개인정보 — 절대 커밋 금지)
+*.sqlite
+*.db
+*.dump
+*.sql
+
+# 기타
+.DS_Store
