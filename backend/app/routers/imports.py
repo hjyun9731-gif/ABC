@@ -17,6 +17,7 @@ from typing import Any
 import pandas as pd
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError, DataError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..billing import charge_item, monthly_charge, next_month_ym
@@ -72,6 +73,40 @@ def _clean(v: Any) -> str:
     if s.endswith(".0"):
         s = s[:-2]
     return s.strip()
+
+
+def _clip(v: Any, max_len: int) -> str | None:
+    """DB VARCHAR 길이 초과로 저장 시 500 나는 문제 방지."""
+    s = _clean(v)
+    if not s:
+        return None
+    return s[:max_len]
+
+
+def _make_unique_mgmt_no(db: Session, base: str) -> str:
+    base = (_clean(base) or "신00-000")[:16]
+    exists = db.scalar(select(Member.id).where(Member.mgmt_no == base).limit(1))
+    if not exists:
+        return base
+    # 기존 관리번호와 충돌하면 뒤에 -2, -3을 붙이되 전체 16자 제한 유지
+    for i in range(2, 1000):
+        suffix = f"-{i}"
+        candidate = f"{base[:16-len(suffix)]}{suffix}"
+        exists = db.scalar(select(Member.id).where(Member.mgmt_no == candidate).limit(1))
+        if not exists:
+            return candidate
+    return base[:12] + "-dup"
+
+
+def _next_member_id(db: Session) -> str:
+    """M00001 형식의 다음 ID. count 기반 중복 방지."""
+    ids = db.scalars(select(Member.id).where(Member.id.like("M%"))).all()
+    max_no = 0
+    for mid in ids:
+        m = re.search(r"(\d+)$", str(mid or ""))
+        if m:
+            max_no = max(max_no, int(m.group(1)))
+    return f"M{max_no + 1:05d}"
 
 
 def _money(v: Any) -> int:
@@ -386,11 +421,11 @@ def _member_payload(row: dict[str, Any], index: int, columns: list[str], db: Ses
         prefix = "양" if "양" in " ".join(_clean(row.get(c)) for c in columns) else "신"
         mgmt_no = f"{prefix}{yy}-{current_count + index + 1:03d}"
     return {
-        "id": "", "mgmt_no": mgmt_no, "reg_type": "양도양수" if mgmt_no.startswith("양") else "신규",
-        "name": name, "vehicle_no": vehicle, "phone": _clean(row.get(phone_col)) if phone_col else None,
-        "sigun": sigun, "region_raw": region_raw or sigun, "member_type": member_type, "membership": membership,
+        "id": "", "mgmt_no": _clip(mgmt_no, 16), "reg_type": "양도양수" if mgmt_no.startswith("양") else "신규",
+        "name": _clip(name, 40), "vehicle_no": _clip(vehicle, 20), "phone": _clip(row.get(phone_col), 20) if phone_col else None,
+        "sigun": _clip(sigun, 20) or "미분류", "region_raw": _clip(region_raw or sigun, 40), "member_type": _clip(member_type, 8) or "개인", "membership": _clip(membership, 12) or "협회미가입",
         "birth_year": None, "cert_issue_date": cert_date, "assoc_join_date": join_date,
-        "billing_start_ym": billing_start, "charge_item": charge, "monthly_charge": monthly,
+        "billing_start_ym": _clip(billing_start, 7), "charge_item": _clip(charge, 8) or "관리비", "monthly_charge": monthly,
         "last_payment_ym": None, "status": "정상", "is_disconnected": False, "cert_missing": cert_date is None,
         "memo": "엑셀 업로드 반영",
     }
@@ -446,20 +481,32 @@ def commit_import(file_type: str = Form(...), file: UploadFile = File(...), db: 
             existing = _find_member(db, payload["name"], payload["vehicle_no"])
             try:
                 if existing:
-                    # 빈 값으로 기존 값을 지우지 않는다. 있는 값만 보강한다.
+                    # 빈 값으로 기존 값을 지우지 않는다. 관리번호는 충돌 위험이 있어 기존 값 우선.
                     for key, value in payload.items():
-                        if key == "id" or value in (None, ""):
+                        if key in {"id", "mgmt_no"} or value in (None, ""):
                             continue
                         setattr(existing, key, value)
                     updated += 1
                 else:
-                    seq = (db.scalar(select(func.count()).select_from(Member)) or 0) + 1
-                    payload["id"] = f"M{seq:05d}"
+                    payload["id"] = _next_member_id(db)
+                    payload["mgmt_no"] = _make_unique_mgmt_no(db, payload.get("mgmt_no") or payload["id"])
                     db.add(Member(**payload))
                     inserted += 1
+                if (inserted + updated) % 200 == 0:
+                    db.commit()
+            except (IntegrityError, DataError) as exc:
+                db.rollback()
+                skipped += 1
+                errors.append(f"{idx}행 저장 실패: {str(exc.orig)[:160]}")
             except Exception as exc:
-                errors.append(f"{idx}행: {exc}")
-        db.commit()
+                db.rollback()
+                skipped += 1
+                errors.append(f"{idx}행 저장 실패: {type(exc).__name__}: {str(exc)[:160]}")
+        try:
+            db.commit()
+        except SQLAlchemyError as exc:
+            db.rollback()
+            errors.append(f"마지막 저장 실패: {str(exc)[:200]}")
         return {"ok": True, "filename": filename, "type": "members", "inserted": inserted, "updated": updated, "skipped": skipped, "errors": errors[:20]}
 
     if file_type in {"arrears", "receivables", "미수금명단"}:
@@ -516,7 +563,11 @@ def commit_import(file_type: str = Form(...), file: UploadFile = File(...), db: 
                         inserted += 1
                 else:
                     skipped += 1
-        db.commit()
+        try:
+            db.commit()
+        except SQLAlchemyError as exc:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=f"미수금 저장 실패: {str(exc)[:300]}") from exc
         return {"ok": True, "filename": filename, "type": "arrears", "inserted": inserted, "updated": updated, "skipped": skipped, "errors": errors[:20]}
 
     if file_type in {"deposits", "bank", "통장거래내역"}:
@@ -533,9 +584,13 @@ def commit_import(file_type: str = Form(...), file: UploadFile = File(...), db: 
                 skipped += 1
                 continue
             memo = " ".join(_clean(row.get(c)) for c in columns if c not in {date_col, name_col, amount_col})[:60]
-            db.add(Deposit(deposit_date=d, depositor_name=name, amount=amt, memo=memo, status="대기", is_excluded=False))
+            db.add(Deposit(deposit_date=d, depositor_name=_clip(name, 40) or "입금자미상", amount=amt, memo=_clip(memo, 60), status="대기", is_excluded=False))
             inserted += 1
-        db.commit()
+        try:
+            db.commit()
+        except SQLAlchemyError as exc:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=f"통장거래 저장 실패: {str(exc)[:300]}") from exc
         return {"ok": True, "filename": filename, "type": "deposits", "inserted": inserted, "updated": 0, "skipped": skipped, "errors": errors[:20]}
 
     raise HTTPException(status_code=400, detail="file_type은 members / arrears / deposits 중 하나여야 합니다.")
