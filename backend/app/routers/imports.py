@@ -1,9 +1,10 @@
-"""엑셀 업로드/실제 데이터 반영 라우터.
+"""엑셀 업로드/DB 반영 라우터.
 
-목표
-- 전체면허자현황/미수금명단/통장거래내역 등 엑셀을 업로드해 DB에 반영한다.
-- 기본은 upsert/append 방식이며 DROP/TRUNCATE/DELETE는 절대 하지 않는다.
-- 컬럼명이 조금 달라도 한국어 업무 엑셀에서 자주 쓰는 이름을 자동 추정한다.
+중요 원칙
+- 전체면허자현황은 반드시 '개인' + '택배' 시트만 읽는다.
+- 업체세분/선진물류/업체/차량집계는 전체자명단 업로드에서 절대 사용하지 않는다.
+- 2026미수금은 반드시 '2026년회비내역' 시트만 읽는다.
+- 기존 데이터는 일반 업로드에서 삭제하지 않는다. 초기화 버튼을 눌렀을 때만 misu_* 업무 테이블을 비운다.
 """
 
 from __future__ import annotations
@@ -11,13 +12,13 @@ from __future__ import annotations
 import io
 import re
 from datetime import date, datetime
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy import delete, func, select
-from sqlalchemy.exc import IntegrityError, DataError, SQLAlchemyError
+from openpyxl import load_workbook
+from sqlalchemy import delete, func, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..billing import charge_item, monthly_charge, next_month_ym
@@ -32,210 +33,21 @@ SIGUN = [
     "양구군", "인제군", "고성군", "양양군",
 ]
 
-NAME_KEYS = ["업체명 및 대표자", "업체명및대표자", "성명", "이름", "대표자", "대표자명", "회원명", "사업자명", "성명(대표자)", "성명대표자"]
-VEHICLE_KEYS = ["차량번호", "차량 번호", "차량", "차량등록번호", "자동차등록번호", "자동차 등록번호", "등록번호", "차량No", "차량NO"]
-PHONE_KEYS = ["휴대폰", "핸드폰", "전화번호", "연락처", "휴대전화", "휴대폰번호"]
-REGION_KEYS = ["지역", "시군", "관할", "주소", "공문주소", "주소지", "사용본거지"]
-MGMT_KEYS = ["관리번호", "관리 번호"]
-MEMBER_TYPE_KEYS = ["회원구분", "구분", "개인택배", "업종"]
-JOIN_KEYS = ["협회가입일", "가입일", "가입일자", "협회 가입일"]
-CERT_KEYS = ["자격증명발급일", "자격증명 발급일", "자격증명발급일자", "발급일", "발급일자"]
-AMOUNT_KEYS = ["미수금", "미납금액", "미납액", "미납", "합계", "총액", "금액", "미수금액", "잔액"]
-DEPOSIT_NAME_KEYS = ["입금자명", "입금자", "예금주", "거래기록사항", "내용"]
-DEPOSIT_DATE_KEYS = ["입금일", "거래일", "일자", "거래일자", "날짜"]
-DEPOSIT_AMOUNT_KEYS = ["입금액", "입금", "금액", "거래금액"]
+STANDARD_MEMBER_COLUMNS = [
+    "지역", "회원구분", "관리번호", "차량번호", "성명", "주민등록번호", "주소", "전화번호", "핸드폰",
+    "인가일자", "가입일자", "자격증명 발급일자", "자격증명 발급번호", "운전면허증번호",
+    "차종", "유종", "사업자등록번호", "소속업체", "공문 주소", "대리인", "구조변경",
+    "비고", "전화 메모", "가입여부", "부과구분",
+]
 
-
-def _norm_col(c: Any) -> str:
-    return re.sub(r"\s+", "", str(c or "").strip())
-
-
-def _find_col(columns: list[str], candidates: list[str]) -> str | None:
-    norm_map = {_norm_col(c): c for c in columns}
-    for key in candidates:
-        nk = _norm_col(key)
-        if nk in norm_map:
-            return norm_map[nk]
-    for c in columns:
-        nc = _norm_col(c)
-        for key in candidates:
-            if _norm_col(key) in nc:
-                return c
-    return None
+ARREARS_PREVIEW_COLUMNS = [
+    "지역", "계정", "비고", "차량번호", "성명", "대수", "이월금",
+    "1월 미수금", "2월 미수금", "3월 미수금", "4월 미수금", "5월 미수금", "6월 미수금",
+    "7월 미수금", "8월 미수금", "9월 미수금", "10월 미수금", "11월 미수금", "12월 미수금",
+]
 
 
 def _clean(v: Any) -> str:
-    if v is None:
-        return ""
-    if pd.isna(v):
-        return ""
-    s = str(v).strip()
-    if s.endswith(".0"):
-        s = s[:-2]
-    return s.strip()
-
-
-def _clip(v: Any, max_len: int) -> str | None:
-    """DB VARCHAR 길이 초과로 저장 시 500 나는 문제 방지."""
-    s = _clean(v)
-    if not s:
-        return None
-    return s[:max_len]
-
-
-def _make_unique_mgmt_no(db: Session, base: str) -> str:
-    base = (_clean(base) or "신00-000")[:16]
-    exists = db.scalar(select(Member.id).where(Member.mgmt_no == base).limit(1))
-    if not exists:
-        return base
-    # 기존 관리번호와 충돌하면 뒤에 -2, -3을 붙이되 전체 16자 제한 유지
-    for i in range(2, 1000):
-        suffix = f"-{i}"
-        candidate = f"{base[:16-len(suffix)]}{suffix}"
-        exists = db.scalar(select(Member.id).where(Member.mgmt_no == candidate).limit(1))
-        if not exists:
-            return candidate
-    return base[:12] + "-dup"
-
-
-def _next_member_id(db: Session) -> str:
-    """M00001 형식의 다음 ID. count 기반 중복 방지."""
-    ids = db.scalars(select(Member.id).where(Member.id.like("M%"))).all()
-    max_no = 0
-    for mid in ids:
-        m = re.search(r"(\d+)$", str(mid or ""))
-        if m:
-            max_no = max(max_no, int(m.group(1)))
-    return f"M{max_no + 1:05d}"
-
-
-def _money(v: Any) -> int:
-    s = _clean(v)
-    if not s:
-        return 0
-    s = re.sub(r"[^0-9\-]", "", s)
-    try:
-        return max(0, int(s or 0))
-    except ValueError:
-        return 0
-
-
-def _parse_date(v: Any) -> date | None:
-    s = _clean(v)
-    if not s:
-        return None
-    try:
-        return pd.to_datetime(s).date()
-    except Exception:
-        pass
-    # 주민/엑셀에서 20260610, 260610 형태 대응
-    digits = re.sub(r"\D", "", s)
-    try:
-        if len(digits) == 8:
-            return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
-        if len(digits) == 6:
-            yy = int(digits[:2])
-            y = 2000 + yy if yy < 80 else 1900 + yy
-            return date(y, int(digits[2:4]), int(digits[4:6]))
-    except Exception:
-        return None
-    return None
-
-
-def _sigun_from_text(text: str) -> str:
-    for s in SIGUN:
-        if s in text:
-            return s
-        short = s[:-1]
-        if short and short in text:
-            return s
-    return "미분류"
-
-
-def _is_region_marker(value: str) -> bool:
-    """전체면허자현황에서 지역 제목행(예: 춘천시)만 이름으로 오인하지 않도록 방지."""
-    v = _clean(value).replace(" ", "")
-    if not v:
-        return False
-    return any(v == s.replace(" ", "") or v == s[:-1].replace(" ", "") for s in SIGUN)
-
-
-def _prepare_member_rows(rows: list[dict[str, Any]], columns: list[str]) -> list[dict[str, Any]]:
-    """전체면허자현황은 한 업체/대표자 아래에 차량 여러 대가 이어지는 병합셀/빈셀 구조가 많다.
-
-    예) 첫 행에 업체명·주소만 있고, 다음 차량행은 업체명 칸이 비어 있는 경우가 많으므로
-    업체명/주소/전화번호/가입일자 같은 기준값은 위 행 값을 이어받게 한다.
-    단, '춘천시' 같은 지역 구분행은 대표자명으로 이어받지 않는다.
-    """
-    if not rows:
-        return rows
-    name_col = _find_col(columns, NAME_KEYS)
-    vehicle_col = _find_col(columns, VEHICLE_KEYS)
-    carry_cols: list[str] = []
-    for keys in (NAME_KEYS, REGION_KEYS, PHONE_KEYS, MGMT_KEYS, CERT_KEYS, JOIN_KEYS, MEMBER_TYPE_KEYS):
-        c = _find_col(columns, keys)
-        if c and c not in carry_cols:
-            carry_cols.append(c)
-    carry: dict[str, Any] = {}
-    prepared: list[dict[str, Any]] = []
-    for row in rows:
-        new = dict(row)
-        vehicle = _clean(new.get(vehicle_col)) if vehicle_col else ""
-        raw_name = _clean(new.get(name_col)) if name_col else ""
-
-        # 값이 있는 셀은 carry 갱신. 단, 지역 제목행은 이름 carry로 쓰지 않음.
-        for c in carry_cols:
-            val = _clean(new.get(c))
-            if not val:
-                continue
-            if c == name_col and _is_region_marker(val) and not vehicle:
-                continue
-            carry[c] = new.get(c)
-
-        # 빈 셀은 바로 위 유효값으로 보강한다.
-        # 차량번호가 있는 행은 실제 회원/차량 행일 가능성이 높으므로 대표자·주소 등을 반드시 이어받는다.
-        for c in carry_cols:
-            if not _clean(new.get(c)) and c in carry:
-                new[c] = carry[c]
-
-        # 그래도 이름이 지역명뿐이면 저장 대상에서 제외되도록 비워 둔다.
-        if name_col and _is_region_marker(_clean(new.get(name_col))) and not vehicle:
-            new[name_col] = ""
-        prepared.append(new)
-    return prepared
-
-
-def _vehicle_last4(vehicle: str) -> str:
-    digits = re.findall(r"\d+", vehicle or "")
-    if not digits:
-        return ""
-    return digits[-1][-4:]
-
-
-def _member_type(row: dict[str, Any], vehicle: str, columns: list[str]) -> str:
-    c = _find_col(columns, MEMBER_TYPE_KEYS)
-    raw = _clean(row.get(c)) if c else ""
-    joined = raw + " " + vehicle
-    if "택배" in joined or "배" in vehicle:
-        return "택배"
-    return "개인"
-
-
-def _membership(row: dict[str, Any], columns: list[str]) -> str:
-    joined = " ".join(_clean(row.get(c)) for c in columns)
-    join_col = _find_col(columns, JOIN_KEYS)
-    if join_col and _clean(row.get(join_col)):
-        return "협회가입"
-    if "미가입" in joined:
-        return "협회미가입"
-    if "협회가입" in joined or "가입" in joined:
-        return "협회가입"
-    return "협회미가입"
-
-
-
-def _json_safe(v: Any) -> Any:
-    """FastAPI가 pandas/엑셀 값을 JSON으로 변환하다 500 나는 문제 방지."""
     if v is None:
         return ""
     try:
@@ -243,481 +55,488 @@ def _json_safe(v: Any) -> Any:
             return ""
     except Exception:
         pass
-    if isinstance(v, (datetime, date)):
+    if isinstance(v, datetime):
+        return v.date().isoformat()
+    if isinstance(v, date):
         return v.isoformat()
-    # pandas Timestamp / numpy scalar 대응
-    if hasattr(v, "isoformat") and "Timestamp" in type(v).__name__:
-        try:
-            return v.isoformat()
-        except Exception:
-            return str(v)
-    if hasattr(v, "item"):
-        try:
-            return v.item()
-        except Exception:
-            pass
-    return v
+    s = str(v).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s.strip()
 
 
-def _json_safe_row(row: dict[str, Any]) -> dict[str, Any]:
-    return {str(k): _json_safe(v) for k, v in row.items()}
+def _norm_col(v: Any) -> str:
+    return re.sub(r"\s+", "", _clean(v))
 
 
-def _make_unique_columns(values: list[Any]) -> list[str]:
-    seen: dict[str, int] = {}
-    cols: list[str] = []
-    for i, v in enumerate(values, start=1):
-        name = _clean(v) or f"컬럼{i}"
-        # 엑셀의 Unnamed 컬럼/빈 컬럼 정리
-        if name.lower().startswith("unnamed"):
-            name = f"컬럼{i}"
-        base = name
-        if base in seen:
-            seen[base] += 1
-            name = f"{base}_{seen[base]}"
-        else:
-            seen[base] = 1
-        cols.append(name)
-    return cols
+def _person_name(v: Any) -> str:
+    return re.sub(r"\s+", "", _clean(v))
 
 
-def _header_score(values: list[Any]) -> int:
-    joined_cells = [_norm_col(v) for v in values if _clean(v)]
-    if not joined_cells:
+def _clip(v: Any, n: int) -> str | None:
+    s = _clean(v)
+    return s[:n] if s else None
+
+
+def _money(v: Any) -> int:
+    s = _clean(v).replace("\u3000", "")
+    if not s or s in {"-", "–", "—"}:
         return 0
-    candidates = (
-        NAME_KEYS + VEHICLE_KEYS + PHONE_KEYS + REGION_KEYS + MGMT_KEYS + MEMBER_TYPE_KEYS +
-        JOIN_KEYS + CERT_KEYS + AMOUNT_KEYS + DEPOSIT_NAME_KEYS + DEPOSIT_DATE_KEYS + DEPOSIT_AMOUNT_KEYS
-    )
-    score = 0
-    for cell in joined_cells:
-        for key in candidates:
-            nk = _norm_col(key)
-            if nk and (nk == cell or nk in cell or cell in nk):
-                score += 1
-                break
-    return score
-
-
-def _normalize_sheet(df: pd.DataFrame) -> pd.DataFrame:
-    """헤더가 1행이 아닌 협회 엑셀도 읽도록 헤더 행 자동 탐지."""
-    df = df.dropna(how="all")
-    if df.empty:
-        return df
-    # 좌우가 전부 빈 컬럼 제거
-    df = df.dropna(axis=1, how="all")
-    if df.empty:
-        return df
-
-    # 상단 30행 중 이름/차량번호/금액 같은 업무 컬럼명이 가장 많이 들어있는 행을 헤더로 사용
-    best_idx = None
-    best_score = 0
-    max_scan = min(len(df), 30)
-    for i in range(max_scan):
-        vals = list(df.iloc[i].values)
-        score = _header_score(vals)
-        if score > best_score:
-            best_score = score
-            best_idx = i
-    if best_idx is not None and best_score >= 2:
-        cols = _make_unique_columns(list(df.iloc[best_idx].values))
-        out = df.iloc[best_idx + 1:].copy()
-        out.columns = cols
-    else:
-        # 그래도 못 찾으면 기존 방식처럼 첫 행을 컬럼으로 간주
-        cols = _make_unique_columns(list(df.iloc[0].values))
-        out = df.iloc[1:].copy()
-        out.columns = cols
-
-    out = out.dropna(how="all")
-    # 완전 빈 행 제거
-    out = out.loc[:, [c for c in out.columns if not str(c).startswith("컬럼") or out[c].astype(str).str.strip().ne("").any()]]
-    return out
-
-
-def _read_excel(file: UploadFile, max_rows: int | None = None) -> tuple[str, list[dict[str, Any]]]:
-    """엑셀을 최대한 안전하게 읽는다.
-
-    기존 pandas 전체시트 로딩은 큰 xlsm 파일에서 Railway 메모리/시간 문제로 502가 날 수 있어
-    xlsx/xlsm은 openpyxl read_only 스트리밍 방식으로 읽는다.
-    """
-    content = file.file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="파일 내용이 비어 있습니다.")
-    name = file.filename or "upload.xlsx"
-    suffix = Path(name).suffix.lower()
-
-    if suffix in {".xlsx", ".xlsm"}:
-        try:
-            from openpyxl import load_workbook
-            wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-            rows_out: list[dict[str, Any]] = []
-            best_sheet_message = ""
-
-            for ws in wb.worksheets:
-                raw_rows_iter = ws.iter_rows(values_only=True)
-                buffer: list[list[Any]] = []
-                # 헤더 탐지를 위해 앞 40행만 먼저 확인
-                for _ in range(40):
-                    try:
-                        vals = list(next(raw_rows_iter))
-                    except StopIteration:
-                        break
-                    if any(_clean(v) for v in vals):
-                        buffer.append(vals)
-
-                if not buffer:
-                    continue
-
-                best_idx = None
-                best_score = 0
-                for i, vals in enumerate(buffer[:30]):
-                    score = _header_score(vals)
-                    if score > best_score:
-                        best_score = score
-                        best_idx = i
-
-                if best_idx is None or best_score < 2:
-                    best_sheet_message = best_sheet_message or f"{ws.title} 시트에서 업무용 헤더를 찾지 못했습니다."
-                    continue
-
-                cols = _make_unique_columns(buffer[best_idx])
-
-                def emit(vals: list[Any]):
-                    # 완전 빈 행은 제외
-                    if not any(_clean(v) for v in vals):
-                        return
-                    # 열 개수 차이 보정
-                    fixed = list(vals[:len(cols)]) + [""] * max(0, len(cols) - len(vals))
-                    row = {cols[i]: _json_safe(fixed[i]) for i in range(len(cols))}
-                    row["__sheet"] = ws.title
-                    rows_out.append(row)
-
-                # 버퍼 중 헤더 이후 데이터
-                for vals in buffer[best_idx + 1:]:
-                    emit(vals)
-                    if max_rows and len(rows_out) >= max_rows:
-                        return name, rows_out
-
-                # 나머지 데이터 스트리밍
-                for vals in raw_rows_iter:
-                    emit(list(vals))
-                    if max_rows and len(rows_out) >= max_rows:
-                        return name, rows_out
-
-                # 첫 유효 시트에서 데이터가 나오면 preview/commit 모두 계속 읽되,
-                # 너무 많은 시트 오탐을 줄이기 위해 다음 시트도 헤더가 있을 때만 추가된다.
-
-            if not rows_out and best_sheet_message:
-                raise HTTPException(status_code=400, detail=best_sheet_message)
-            return name, rows_out
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"엑셀 읽기 실패: {type(exc).__name__}: {exc}") from exc
-
-    # xls/csv는 pandas fallback. 단, preview에서는 nrows로 가볍게 읽는다.
+    s = re.sub(r"[^0-9\-]", "", s)
     try:
-        if suffix == ".xls":
-            sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, dtype=object, header=None, nrows=max_rows)
-            frames = []
-            for sheet, raw in sheets.items():
-                df = _normalize_sheet(raw)
-                if df.empty:
-                    continue
-                df["__sheet"] = sheet
-                frames.append(df)
-            if not frames:
-                return name, []
-            df = pd.concat(frames, ignore_index=True)
-        elif suffix == ".csv":
-            df = pd.read_csv(io.BytesIO(content), dtype=object, encoding="utf-8-sig", nrows=max_rows)
-            df = df.dropna(how="all")
-        else:
-            raise HTTPException(status_code=400, detail="xlsx/xlsm/xls/csv 파일만 업로드할 수 있습니다.")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"엑셀 읽기 실패: {type(exc).__name__}: {exc}") from exc
-    df = df.rename(columns={c: str(c).strip() for c in df.columns})
-    df = df.fillna("")
-    return name, [_json_safe_row(r) for r in df.to_dict(orient="records")]
+        return max(0, int(s or 0))
+    except Exception:
+        return 0
 
-def _member_payload(row: dict[str, Any], index: int, columns: list[str], db: Session) -> dict[str, Any] | None:
-    name_col = _find_col(columns, NAME_KEYS)
-    vehicle_col = _find_col(columns, VEHICLE_KEYS)
-    if not name_col or not vehicle_col:
+
+def _parse_date(v: Any) -> date | None:
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = _clean(v)
+    if not s or s.lower() == "x":
         return None
-    name = _clean(row.get(name_col))
-    vehicle = _clean(row.get(vehicle_col))
-    if not name or not vehicle:
+    try:
+        d = pd.to_datetime(s, errors="coerce")
+        if pd.notna(d):
+            return d.date()
+    except Exception:
+        pass
+    digits = re.sub(r"\D", "", s)
+    try:
+        if len(digits) == 8:
+            return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+        if len(digits) == 6:
+            yy = int(digits[:2])
+            year = 2000 + yy if yy < 80 else 1900 + yy
+            return date(year, int(digits[2:4]), int(digits[4:6]))
+    except Exception:
         return None
-    phone_col = _find_col(columns, PHONE_KEYS)
-    region_col = _find_col(columns, REGION_KEYS)
-    mgmt_col = _find_col(columns, MGMT_KEYS)
-    cert_col = _find_col(columns, CERT_KEYS)
-    join_col = _find_col(columns, JOIN_KEYS)
-    region_raw = _clean(row.get(region_col)) if region_col else ""
-    sigun = _sigun_from_text(region_raw or " ".join(_clean(row.get(c)) for c in columns))
-    member_type = _member_type(row, vehicle, columns)
-    membership = _membership(row, columns)
-    cert_date = _parse_date(row.get(cert_col)) if cert_col else None
-    join_date = _parse_date(row.get(join_col)) if join_col else None
-    charge = charge_item(membership)
-    monthly = monthly_charge(membership, birth_year=None)
-    base_date = join_date if membership == "협회가입" and join_date else cert_date
-    billing_start = next_month_ym(base_date) if base_date else None
-    current_count = db.scalar(select(func.count()).select_from(Member)) or 0
-    yy = (cert_date or date.today()).strftime("%y")
-    mgmt_no = _clean(row.get(mgmt_col)) if mgmt_col else ""
-    if not mgmt_no:
-        prefix = "양" if "양" in " ".join(_clean(row.get(c)) for c in columns) else "신"
-        mgmt_no = f"{prefix}{yy}-{current_count + index + 1:03d}"
-    return {
-        "id": "", "mgmt_no": _clip(mgmt_no, 16), "reg_type": "양도양수" if mgmt_no.startswith("양") else "신규",
-        "name": _clip(name, 40), "vehicle_no": _clip(vehicle, 20), "phone": _clip(row.get(phone_col), 20) if phone_col else None,
-        "sigun": _clip(sigun, 20) or "미분류", "region_raw": _clip(region_raw or sigun, 40), "member_type": _clip(member_type, 8) or "개인", "membership": _clip(membership, 12) or "협회미가입",
-        "birth_year": None, "cert_issue_date": cert_date, "assoc_join_date": join_date,
-        "billing_start_ym": _clip(billing_start, 7), "charge_item": _clip(charge, 8) or "관리비", "monthly_charge": monthly,
-        "last_payment_ym": None, "status": "정상", "is_disconnected": False, "cert_missing": cert_date is None,
-        "memo": "엑셀 업로드 반영",
-    }
-
-
-def _find_member(db: Session, name: str, vehicle: str) -> Member | None:
-    vehicle_last4 = _vehicle_last4(vehicle)
-    if vehicle:
-        m = db.scalar(select(Member).where(Member.vehicle_no == vehicle).limit(1))
-        if m:
-            return m
-    if name and vehicle_last4:
-        candidates = db.scalars(select(Member).where(Member.name == name)).all()
-        for m in candidates:
-            if _vehicle_last4(m.vehicle_no) == vehicle_last4:
-                return m
-    if name:
-        return db.scalar(select(Member).where(Member.name == name).limit(1))
     return None
 
 
+def _json(v: Any) -> Any:
+    if isinstance(v, (date, datetime)):
+        return v.isoformat()
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    return _clean(v)
+
+
+def _sigun_from_text(text: str) -> str:
+    t = _clean(text).replace(" ", "")
+    for s in SIGUN:
+        if s.replace(" ", "") in t or s[:-1] in t:
+            return s
+    return "미분류"
+
+
+def _vehicle_last4(vehicle: str) -> str:
+    nums = re.findall(r"\d+", _clean(vehicle))
+    if not nums:
+        return ""
+    return nums[-1][-4:]
+
+
+def _valid_vehicle(vehicle: str) -> bool:
+    v = _clean(vehicle)
+    if not v or "?" in v:
+        return False
+    return len(_vehicle_last4(v)) >= 4
+
+
+def _birth_year(rrn: str) -> int | None:
+    s = re.sub(r"\D", "", _clean(rrn))
+    if len(s) < 7:
+        return None
+    yy = int(s[:2])
+    marker = s[6]
+    if marker in {"1", "2", "5", "6"}:
+        return 1900 + yy
+    if marker in {"3", "4", "7", "8"}:
+        return 2000 + yy
+    return 1900 + yy if yy > 30 else 2000 + yy
+
+
+def _membership_from(row: dict[str, Any]) -> str:
+    val = _clean(row.get("가입여부"))
+    join = _clean(row.get("가입일자"))
+    negative = {"x", "X", "×", "미가입", "비가입", "없음", "-"}
+    if val in negative or "미가입" in val:
+        return "협회미가입"
+    if "가입" in val and "미가입" not in val:
+        return "협회가입"
+    if join and join not in negative and "미가입" not in join:
+        return "협회가입"
+    return "협회미가입"
+
+
+def _next_member_id_from_no(no: int) -> str:
+    return f"M{no:05d}"
+
+
+def _current_max_member_no(db: Session) -> int:
+    ids = db.scalars(select(Member.id).where(Member.id.like("M%"))).all()
+    max_no = 0
+    for mid in ids:
+        m = re.search(r"(\d+)$", str(mid or ""))
+        if m:
+            max_no = max(max_no, int(m.group(1)))
+    return max_no
+
+
+def _make_mgmt_no(raw: str, fallback_no: int) -> str:
+    s = _clean(raw)
+    return (s or f"신26-{fallback_no:03d}")[:16]
+
+
+def _find_existing_member(db: Session, name: str, vehicle_no: str) -> Member | None:
+    name = _person_name(name)
+    last4 = _vehicle_last4(vehicle_no)
+    exact = db.scalar(select(Member).where(Member.vehicle_no == vehicle_no).limit(1))
+    if exact:
+        return exact
+    if last4 and name:
+        candidates = db.scalars(select(Member).where(Member.name == name)).all()
+        for c in candidates:
+            if _vehicle_last4(c.vehicle_no) == last4:
+                return c
+    return None
+
+
+def _find_member_for_arrears(db: Session, name: str, vehicle_no: str) -> Member | None:
+    return _find_existing_member(db, name, vehicle_no)
+
+
+def _read_workbook(file_bytes: bytes):
+    return load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True, keep_links=False)
+
+
+def _header_map(ws, max_col: int = 80) -> tuple[list[str], dict[str, int]]:
+    row = next(ws.iter_rows(min_row=1, max_row=1, max_col=max_col, values_only=True))
+    headers: list[str] = []
+    mapping: dict[str, int] = {}
+    for idx, v in enumerate(row, start=1):
+        h = _clean(v)
+        if not h:
+            continue
+        h = re.sub(r"\s+", " ", h.replace("\n", " ")).strip()
+        headers.append(h)
+        mapping[_norm_col(h)] = idx
+    return headers, mapping
+
+
+def _get(row: tuple, mapping: dict[str, int], *keys: str) -> Any:
+    for key in keys:
+        idx = mapping.get(_norm_col(key))
+        if idx is not None and idx - 1 < len(row):
+            return row[idx - 1]
+    return None
+
+
+def _iter_license_rows(file_bytes: bytes, preview_limit: int | None = None) -> list[dict[str, Any]]:
+    wb = _read_workbook(file_bytes)
+    rows: list[dict[str, Any]] = []
+    for sheet_name, member_type in (("개인", "개인"), ("택배", "택배")):
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        _, m = _header_map(ws, max_col=80)
+        for row in ws.iter_rows(min_row=2, max_col=80, values_only=True):
+            vehicle = _clean(_get(row, m, "차량번호"))
+            name = _person_name(_get(row, m, "성명", "성 명", "성    명"))
+            if not _valid_vehicle(vehicle) or not name:
+                continue
+            region = _clean(_get(row, m, "지역")) or _sigun_from_text(_clean(_get(row, m, "주소")))
+            membership = _membership_from({
+                "가입여부": _get(row, m, "가입여부"),
+                "가입일자": _get(row, m, "가입일자"),
+            })
+            row_out = {
+                "지역": region or "미분류",
+                "회원구분": member_type,
+                "관리번호": _clean(_get(row, m, "관리번호")),
+                "차량번호": vehicle,
+                "성명": name,
+                "주민등록번호": _clean(_get(row, m, "주민등록번호")),
+                "주소": _clean(_get(row, m, "주소", "주 소")),
+                "전화번호": _clean(_get(row, m, "전화번호")),
+                "핸드폰": _clean(_get(row, m, "핸드폰", "핸 드 폰")),
+                "인가일자": _json(_get(row, m, "인가일자")),
+                "가입일자": _json(_get(row, m, "가입일자")),
+                "자격증명 발급일자": _json(_get(row, m, "자격증명 발급일자", "자격증명 발급일", "자격증명\n발급일자")),
+                "자격증명 발급번호": _clean(_get(row, m, "자격증명 발급번호", "자격증명\n발급번호")),
+                "운전면허증번호": _clean(_get(row, m, "운전면허증번호")),
+                "차종": _clean(_get(row, m, "차종")),
+                "유종": _clean(_get(row, m, "유종")),
+                "사업자등록번호": _clean(_get(row, m, "사업자등록번호")),
+                "소속업체": _clean(_get(row, m, "소속업체")),
+                "공문 주소": _clean(_get(row, m, "공문 주소", "공문주소")),
+                "대리인": _clean(_get(row, m, "대리인")),
+                "구조변경": _clean(_get(row, m, "구조변경")),
+                "비고": _clean(_get(row, m, "비고")),
+                "전화 메모": _clean(_get(row, m, "전화 메모", "전화메모")),
+                "가입여부": membership,
+                "부과구분": charge_item(membership),
+            }
+            rows.append(row_out)
+            if preview_limit and len(rows) >= preview_limit:
+                return rows
+    return rows
+
+
+def _iter_arrears_rows(file_bytes: bytes, preview_limit: int | None = None) -> list[dict[str, Any]]:
+    wb = _read_workbook(file_bytes)
+    if "2026년회비내역" not in wb.sheetnames:
+        raise HTTPException(status_code=400, detail="미수금 파일에서 '2026년회비내역' 시트를 찾지 못했습니다.")
+    ws = wb["2026년회비내역"]
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, max_col=80, values_only=True))
+    headers = [_clean(x) for x in header_row]
+
+    def col_idx(label: str) -> int | None:
+        nl = _norm_col(label)
+        for i, h in enumerate(headers):
+            if _norm_col(h) == nl:
+                return i
+        return None
+
+    base_cols = {
+        "지역": col_idx("지역"), "계정": col_idx("계정"), "비고": col_idx("비고"),
+        "차량번호": col_idx("차량번호"), "성명": col_idx("성명"), "대수": col_idx("대수"), "이월금": col_idx("이월금"),
+    }
+    month_cols = {month: col_idx(f"{month}월 미수금") for month in range(1, 13)}
+    rows: list[dict[str, Any]] = []
+    for row in ws.iter_rows(min_row=2, max_col=80, values_only=True):
+        vehicle = _clean(row[base_cols["차량번호"]]) if base_cols["차량번호"] is not None else ""
+        name = _person_name(row[base_cols["성명"]]) if base_cols["성명"] is not None else ""
+        if not _valid_vehicle(vehicle) or not name:
+            continue
+        out = {
+            "지역": _clean(row[base_cols["지역"]]) if base_cols["지역"] is not None else "",
+            "계정": _clean(row[base_cols["계정"]]) if base_cols["계정"] is not None else "",
+            "비고": _clean(row[base_cols["비고"]]) if base_cols["비고"] is not None else "",
+            "차량번호": vehicle,
+            "성명": name,
+            "대수": _clean(row[base_cols["대수"]]) if base_cols["대수"] is not None else "",
+            "이월금": _money(row[base_cols["이월금"]]) if base_cols["이월금"] is not None else 0,
+        }
+        for month in range(1, 13):
+            idx = month_cols.get(month)
+            out[f"{month}월 미수금"] = _money(row[idx]) if idx is not None and idx < len(row) else 0
+        rows.append(out)
+        if preview_limit and len(rows) >= preview_limit:
+            return rows
+    return rows
+
+
+def _iter_deposit_rows(file_bytes: bytes, preview_limit: int | None = None) -> list[dict[str, Any]]:
+    # 일반 통장거래내역은 형식이 다양하므로 pandas로 첫 시트 헤더 자동 추정
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, dtype=object)
+    df = df.dropna(how="all").head(preview_limit or 5000)
+    return [{str(k): _json(v) for k, v in r.items()} for r in df.to_dict("records")]
+
+
+@router.post("/preview")
+async def preview_import(file_type: str = Form(...), file: UploadFile = File(...)):
+    data = await file.read()
+    try:
+        if file_type == "members":
+            rows = _iter_license_rows(data, preview_limit=300)
+            return {
+                "ok": True,
+                "filename": file.filename,
+                "type": "members",
+                "message": "전체면허자현황은 '개인' + '택배' 시트만 읽습니다. 업체세분/업체/차량집계는 제외됩니다.",
+                "total_rows": len(rows),
+                "columns": STANDARD_MEMBER_COLUMNS,
+                "raw_columns": ["개인 시트", "택배 시트"],
+                "sample": rows,
+            }
+        if file_type == "arrears":
+            rows = _iter_arrears_rows(data, preview_limit=300)
+            return {
+                "ok": True,
+                "filename": file.filename,
+                "type": "arrears",
+                "message": "미수금명단은 '2026년회비내역' 시트의 이월금 + 월별 미수금만 읽습니다.",
+                "total_rows": len(rows),
+                "columns": ARREARS_PREVIEW_COLUMNS,
+                "raw_columns": ["2026년회비내역"],
+                "sample": rows,
+            }
+        if file_type == "deposits":
+            rows = _iter_deposit_rows(data, preview_limit=300)
+            cols = list(rows[0].keys()) if rows else []
+            return {"ok": True, "filename": file.filename, "type": "deposits", "total_rows": len(rows), "columns": cols, "raw_columns": cols, "sample": rows}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"엑셀 미리보기 실패: {str(exc)[:500]}") from exc
+    raise HTTPException(status_code=400, detail="file_type은 members / arrears / deposits 중 하나여야 합니다.")
 
 
 @router.post("/reset")
 def reset_misu_data(db: Session = Depends(get_db)):
-    """사용자 요청 시 misu_* 업무 데이터만 비운다.
-
-    기존 Railway/Postgres의 다른 테이블은 건드리지 않고,
-    이 프로그램에서 만든 misu_ 접두 테이블만 초기화한다.
-    """
-    counts = {}
-    # FK 때문에 자식 테이블부터 정리한다.
-    tables = [Payment, ReceivableItem, Closure, Deposit, Pending, MemberHistory, Member]
     try:
-        for model in tables:
-            before = db.scalar(select(func.count()).select_from(model)) or 0
-            db.execute(delete(model))
-            counts[model.__tablename__] = before
+        # FK 순서 때문에 자식 테이블부터 비운다. misu_* 업무 테이블만 대상으로 한다.
+        db.execute(delete(MemberHistory))
+        db.execute(delete(Payment))
+        db.execute(delete(ReceivableItem))
+        db.execute(delete(Closure))
+        db.execute(delete(Deposit))
+        db.execute(delete(Pending))
+        db.execute(delete(Member))
         db.commit()
-        return {"ok": True, "message": "misu_* 업무 데이터 초기화 완료", "deleted": counts}
+        return {"ok": True, "message": "misu_* 업무 데이터 초기화 완료"}
     except SQLAlchemyError as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail=f"초기화 실패: {str(exc)[:300]}") from exc
 
 
-@router.post("/preview")
-def preview_import(file_type: str = Form(...), file: UploadFile = File(...)):
-    filename, rows = _read_excel(file, max_rows=300)
-    if not rows:
-        return {"filename": filename, "file_type": file_type, "total_rows": 0, "columns": [], "sample": [], "message": "읽을 수 있는 데이터 행이 없습니다. 시트/헤더를 확인해 주세요."}
-    columns = [c for c in rows[0].keys() if not c.startswith("__")]
-    return {
-        "filename": filename,
-        "file_type": file_type,
-        "total_rows": len(rows),
-        "columns": columns,
-        "sample": rows[:10],
-        "message": "미리보기입니다. 저장 버튼을 눌러야 DB에 반영됩니다.",
-    }
-
-
 @router.post("/commit")
-def commit_import(file_type: str = Form(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
-    filename, rows = _read_excel(file)
-    if not rows:
-        return {"ok": True, "filename": filename, "inserted": 0, "updated": 0, "skipped": 0, "errors": []}
-    columns = [c for c in rows[0].keys() if not c.startswith("__")]
-    inserted = updated = skipped = 0
-    errors: list[str] = []
-
-    if file_type in {"members", "license", "전체면허자현황"}:
-        rows = _prepare_member_rows(rows, columns)
-        # 같은 업로드 파일 안에서 아직 commit 되지 않은 신규 회원끼리도
-        # M00001 같은 PK가 중복되지 않도록 ID/관리번호를 메모리에서 선점한다.
-        existing_ids = set(str(x) for x in db.scalars(select(Member.id)).all() if x)
-        max_no = 0
-        for mid in existing_ids:
-            m = re.search(r"(\d+)$", mid)
-            if m:
-                max_no = max(max_no, int(m.group(1)))
-        next_no = max_no + 1
-        used_mgmt = set(str(x) for x in db.scalars(select(Member.mgmt_no)).all() if x)
-        pending_by_vehicle: dict[str, Member] = {}
-        pending_by_name_last4: dict[tuple[str, str], Member] = {}
-
-        def allocate_member_id() -> str:
-            nonlocal next_no
-            while True:
-                mid = f"M{next_no:05d}"
-                next_no += 1
-                if mid not in existing_ids:
-                    existing_ids.add(mid)
-                    return mid
-
-        def allocate_mgmt_no(base: str, fallback: str) -> str:
-            raw = (_clean(base) or fallback or "신00-000")[:16]
-            candidate = raw
-            if candidate not in used_mgmt:
-                used_mgmt.add(candidate)
-                return candidate
-            for i in range(2, 10000):
-                suffix = f"-{i}"
-                candidate = f"{raw[:16-len(suffix)]}{suffix}"
-                if candidate not in used_mgmt:
-                    used_mgmt.add(candidate)
-                    return candidate
-            candidate = f"{raw[:11]}-{len(used_mgmt)}"[:16]
-            used_mgmt.add(candidate)
-            return candidate
-
-        for idx, row in enumerate(rows, start=1):
-            payload = _member_payload(row, idx, columns, db)
-            if not payload:
+async def commit_import(file_type: str = Form(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
+    data = await file.read()
+    if file_type == "members":
+        rows = _iter_license_rows(data, preview_limit=None)
+        inserted = updated = skipped = 0
+        next_no = _current_max_member_no(db) + 1
+        used_mgmt: set[str] = set(db.scalars(select(Member.mgmt_no)).all())
+        for row in rows:
+            vehicle = row["차량번호"]
+            name = row["성명"]
+            if not _valid_vehicle(vehicle) or not name:
                 skipped += 1
                 continue
-            vehicle_key = payload.get("vehicle_no") or ""
-            name_last4_key = (payload.get("name") or "", _vehicle_last4(vehicle_key))
-            existing = pending_by_vehicle.get(vehicle_key) if vehicle_key else None
-            if not existing and name_last4_key[0] and name_last4_key[1]:
-                existing = pending_by_name_last4.get(name_last4_key)
-            if not existing:
-                existing = _find_member(db, payload["name"], payload["vehicle_no"])
-            try:
-                if existing:
-                    # 빈 값으로 기존 값을 지우지 않는다. 관리번호는 충돌 위험이 있어 기존 값 우선.
-                    for key, value in payload.items():
-                        if key in {"id", "mgmt_no"} or value in (None, ""):
-                            continue
-                        setattr(existing, key, value)
-                    updated += 1
-                else:
-                    payload["id"] = allocate_member_id()
-                    payload["mgmt_no"] = allocate_mgmt_no(payload.get("mgmt_no") or "", payload["id"])
-                    member = Member(**payload)
-                    db.add(member)
-                    if vehicle_key:
-                        pending_by_vehicle[vehicle_key] = member
-                    if name_last4_key[0] and name_last4_key[1]:
-                        pending_by_name_last4[name_last4_key] = member
-                    inserted += 1
-                if (inserted + updated) % 200 == 0:
-                    db.commit()
-            except (IntegrityError, DataError) as exc:
-                db.rollback()
-                skipped += 1
-                errors.append(f"{idx}행 저장 실패: {str(exc.orig)[:160]}")
-            except Exception as exc:
-                db.rollback()
-                skipped += 1
-                errors.append(f"{idx}행 저장 실패: {type(exc).__name__}: {str(exc)[:160]}")
-        try:
-            db.commit()
-        except SQLAlchemyError as exc:
-            db.rollback()
-            errors.append(f"마지막 저장 실패: {str(exc)[:200]}")
-        return {"ok": True, "filename": filename, "type": "members", "inserted": inserted, "updated": updated, "skipped": skipped, "errors": errors[:20]}
+            existing = _find_existing_member(db, name, vehicle)
+            membership = row["가입여부"]
+            item = charge_item(membership)
+            cert_date = _parse_date(row.get("자격증명 발급일자"))
+            join_date = _parse_date(row.get("가입일자"))
+            start_ym = next_month_ym(join_date if membership == "협회가입" else cert_date)
+            byear = _birth_year(row.get("주민등록번호", ""))
+            age = (date.today().year - byear) if byear else None
+            amount = monthly_charge(membership, age=age, birth_year=byear)
+            memo_parts = []
+            for k in ["주소", "사업자등록번호", "소속업체", "공문 주소", "대리인", "구조변경", "비고", "전화 메모"]:
+                if row.get(k):
+                    memo_parts.append(f"{k}:{row[k]}")
+            memo = " / ".join(memo_parts)[:1000] or "엑셀 업로드 반영"
+            if existing:
+                m = existing
+                m.mgmt_no = m.mgmt_no or _make_mgmt_no(row.get("관리번호", ""), next_no)
+                m.reg_type = "양도양수" if str(m.mgmt_no).startswith("양") else "신규"
+                m.name = name
+                m.vehicle_no = vehicle
+                m.phone = _clip(row.get("핸드폰") or row.get("전화번호"), 20)
+                m.sigun = row.get("지역") or "미분류"
+                m.region_raw = row.get("지역") or "미분류"
+                m.member_type = row.get("회원구분") or "개인"
+                m.membership = membership
+                m.birth_year = byear
+                m.cert_issue_date = cert_date
+                m.assoc_join_date = join_date
+                m.billing_start_ym = start_ym
+                m.charge_item = item
+                m.monthly_charge = amount
+                m.status = m.status or "정상"
+                m.cert_missing = cert_date is None
+                m.memo = memo
+                updated += 1
+            else:
+                mgmt = _make_mgmt_no(row.get("관리번호", ""), next_no)
+                base = mgmt
+                suffix = 2
+                while mgmt in used_mgmt:
+                    tail = f"-{suffix}"
+                    mgmt = f"{base[:16-len(tail)]}{tail}"
+                    suffix += 1
+                used_mgmt.add(mgmt)
+                m = Member(
+                    id=_next_member_id_from_no(next_no),
+                    mgmt_no=mgmt,
+                    reg_type="양도양수" if mgmt.startswith("양") else "신규",
+                    name=name,
+                    vehicle_no=vehicle,
+                    phone=_clip(row.get("핸드폰") or row.get("전화번호"), 20),
+                    sigun=row.get("지역") or "미분류",
+                    region_raw=row.get("지역") or "미분류",
+                    member_type=row.get("회원구분") or "개인",
+                    membership=membership,
+                    birth_year=byear,
+                    cert_issue_date=cert_date,
+                    assoc_join_date=join_date,
+                    billing_start_ym=start_ym,
+                    charge_item=item,
+                    monthly_charge=amount,
+                    status="정상",
+                    is_disconnected=False,
+                    cert_missing=cert_date is None,
+                    memo=memo,
+                )
+                db.add(m)
+                next_no += 1
+                inserted += 1
+            if (inserted + updated) % 500 == 0:
+                db.commit()
+        db.commit()
+        return {"ok": True, "filename": file.filename, "type": "members", "inserted": inserted, "updated": updated, "skipped": skipped, "errors": []}
 
-    if file_type in {"arrears", "receivables", "미수금명단"}:
-        name_col = _find_col(columns, NAME_KEYS)
-        vehicle_col = _find_col(columns, VEHICLE_KEYS)
-        amount_col = _find_col(columns, AMOUNT_KEYS)
-        month_cols = [c for c in columns if re.search(r"(20\d{2}[-./년 ]?\d{1,2}|\d{1,2}\s*월)", str(c))]
-        if not (name_col or vehicle_col):
-            raise HTTPException(status_code=400, detail="미수금 파일에서 이름 또는 차량번호 컬럼을 찾지 못했습니다.")
-        for idx, row in enumerate(rows, start=1):
-            name = _clean(row.get(name_col)) if name_col else ""
-            vehicle = _clean(row.get(vehicle_col)) if vehicle_col else ""
-            member = _find_member(db, name, vehicle)
+    if file_type == "arrears":
+        rows = _iter_arrears_rows(data, preview_limit=None)
+        inserted = updated = skipped = 0
+        for row in rows:
+            member = _find_member_for_arrears(db, row["성명"], row["차량번호"])
             if not member:
                 skipped += 1
                 continue
-            created_for_row = 0
-            # 월별 컬럼 우선 반영
-            for c in month_cols:
-                amt = _money(row.get(c))
+            created = 0
+            carry = _money(row.get("이월금"))
+            if carry > 0:
+                item = db.scalar(select(ReceivableItem).where(ReceivableItem.member_id == member.id, ReceivableItem.ym == "2026-00").limit(1))
+                if item:
+                    item.amount = carry; item.is_paid = False; updated += 1
+                else:
+                    db.add(ReceivableItem(member_id=member.id, ym="2026-00", charge_item=member.charge_item, amount=carry, is_paid=False)); inserted += 1
+                created += 1
+            for month in range(1, 13):
+                amt = _money(row.get(f"{month}월 미수금"))
                 if amt <= 0:
                     continue
-                raw = str(c)
-                m = re.search(r"(20\d{2}).*?(\d{1,2})", raw)
-                if m:
-                    ym = f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"
-                else:
-                    mm = re.search(r"(\d{1,2})\s*월", raw)
-                    year_match = re.search(r"20\d{2}", filename)
-                    yy = int(year_match.group(0)) if year_match else date.today().year
-                    ym = f"{yy:04d}-{int(mm.group(1)):02d}" if mm else f"{date.today().year}-00"
+                ym = f"2026-{month:02d}"
                 item = db.scalar(select(ReceivableItem).where(ReceivableItem.member_id == member.id, ReceivableItem.ym == ym).limit(1))
                 if item:
-                    item.amount = amt
-                    item.is_paid = False
-                    updated += 1
+                    item.amount = amt; item.is_paid = False; updated += 1
                 else:
-                    db.add(ReceivableItem(member_id=member.id, ym=ym, charge_item=member.charge_item, amount=amt, is_paid=False))
-                    inserted += 1
-                created_for_row += 1
-            if created_for_row == 0 and amount_col:
-                amt = _money(row.get(amount_col))
-                if amt > 0:
-                    year_match = re.search(r"20\d{2}", filename)
-                    yy = int(year_match.group(0)) if year_match else date.today().year
-                    ym = f"{yy:04d}-00"
-                    item = db.scalar(select(ReceivableItem).where(ReceivableItem.member_id == member.id, ReceivableItem.ym == ym).limit(1))
-                    if item:
-                        item.amount = amt
-                        item.is_paid = False
-                        updated += 1
-                    else:
-                        db.add(ReceivableItem(member_id=member.id, ym=ym, charge_item=member.charge_item, amount=amt, is_paid=False))
-                        inserted += 1
-                else:
-                    skipped += 1
-        try:
-            db.commit()
-        except SQLAlchemyError as exc:
-            db.rollback()
-            raise HTTPException(status_code=400, detail=f"미수금 저장 실패: {str(exc)[:300]}") from exc
-        return {"ok": True, "filename": filename, "type": "arrears", "inserted": inserted, "updated": updated, "skipped": skipped, "errors": errors[:20]}
+                    db.add(ReceivableItem(member_id=member.id, ym=ym, charge_item=member.charge_item, amount=amt, is_paid=False)); inserted += 1
+                created += 1
+            if created == 0:
+                skipped += 1
+            if (inserted + updated) % 500 == 0:
+                db.commit()
+        db.commit()
+        return {"ok": True, "filename": file.filename, "type": "arrears", "inserted": inserted, "updated": updated, "skipped": skipped, "errors": []}
 
-    if file_type in {"deposits", "bank", "통장거래내역"}:
-        date_col = _find_col(columns, DEPOSIT_DATE_KEYS)
-        name_col = _find_col(columns, DEPOSIT_NAME_KEYS)
-        amount_col = _find_col(columns, DEPOSIT_AMOUNT_KEYS)
-        if not (date_col and name_col and amount_col):
-            raise HTTPException(status_code=400, detail="통장거래내역에서 입금일/입금자명/입금액 컬럼을 찾지 못했습니다.")
-        for idx, row in enumerate(rows, start=1):
-            d = _parse_date(row.get(date_col)) or date.today()
-            name = _clean(row.get(name_col))
-            amt = _money(row.get(amount_col))
+    if file_type == "deposits":
+        rows = _iter_deposit_rows(data, preview_limit=None)
+        inserted = skipped = 0
+        for r in rows:
+            # 최소한 이름/금액처럼 보이는 컬럼을 찾아 저장
+            keys = list(r.keys())
+            name_key = next((k for k in keys if "입금자" in k or "예금주" in k or "거래기록" in k or "내용" in k), None)
+            amt_key = next((k for k in keys if "입금액" in k or "금액" in k), None)
+            date_key = next((k for k in keys if "일자" in k or "일" == k or "날짜" in k), None)
+            name = _clean(r.get(name_key)) if name_key else ""
+            amt = _money(r.get(amt_key)) if amt_key else 0
             if not name or amt <= 0:
                 skipped += 1
                 continue
-            memo = " ".join(_clean(row.get(c)) for c in columns if c not in {date_col, name_col, amount_col})[:60]
-            db.add(Deposit(deposit_date=d, depositor_name=_clip(name, 40) or "입금자미상", amount=amt, memo=_clip(memo, 60), status="대기", is_excluded=False))
+            db.add(Deposit(deposit_date=_parse_date(r.get(date_key)) or date.today(), depositor_name=_clip(name, 40) or "입금자미상", amount=amt, memo="엑셀 업로드", status="대기", is_excluded=False))
             inserted += 1
-        try:
-            db.commit()
-        except SQLAlchemyError as exc:
-            db.rollback()
-            raise HTTPException(status_code=400, detail=f"통장거래 저장 실패: {str(exc)[:300]}") from exc
-        return {"ok": True, "filename": filename, "type": "deposits", "inserted": inserted, "updated": 0, "skipped": skipped, "errors": errors[:20]}
+        db.commit()
+        return {"ok": True, "filename": file.filename, "type": "deposits", "inserted": inserted, "updated": 0, "skipped": skipped, "errors": []}
 
     raise HTTPException(status_code=400, detail="file_type은 members / arrears / deposits 중 하나여야 합니다.")

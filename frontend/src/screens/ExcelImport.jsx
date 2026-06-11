@@ -79,10 +79,12 @@ export default function ExcelImport({ reloadFromDb }) {
     {preview && <Card>
       <div className="card-pad">
         <h3 style={{marginTop:0}}>미리보기: {preview.filename}</h3>
-        <p className="small">총 {preview.total_rows?.toLocaleString()}행 · 컬럼 {preview.columns?.length || 0}개</p>
+        <p className="small">총 {preview.total_rows?.toLocaleString()}행 · 표시 컬럼 {preview.columns?.length || 0}개</p>
+        {preview.message && <p className="small">{preview.message}</p>}
+        {preview.raw_columns?.length ? <p className="small">원본 인식 컬럼: {preview.raw_columns.slice(0,20).join(' · ')}{preview.raw_columns.length>20?' ...':''}</p> : null}
         <div className="tabs" style={{marginBottom:10}}>{preview.columns?.slice(0,24).map(c=><Badge key={c} tone="gray">{c}</Badge>)}</div>
       </div>
-      <div className="table-wrap"><table className="table"><thead><tr>{preview.columns?.slice(0,12).map(c=><th key={c}>{c}</th>)}</tr></thead><tbody>{preview.sample?.map((r,i)=><tr key={i}>{preview.columns?.slice(0,12).map(c=><td key={c}>{String(r[c] ?? '')}</td>)}</tr>)}</tbody></table></div>
+      <div className="table-wrap"><table className="table"><thead><tr>{preview.columns?.slice(0,13).map(c=><th key={c}>{c}</th>)}</tr></thead><tbody>{preview.sample?.map((r,i)=><tr key={i}>{preview.columns?.slice(0,13).map(c=><td key={c}>{String(r[c] ?? '')}</td>)}</tr>)}</tbody></table></div>
     </Card>}
   </div>
 }
