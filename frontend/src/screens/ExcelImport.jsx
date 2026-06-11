@@ -23,6 +23,18 @@ export default function ExcelImport({ reloadFromDb }) {
     catch (e) { setError(e.message) }
     finally { setLoading(false) }
   }
+  async function doReset() {
+    if (!confirm('현재 misu_* 업무 데이터를 초기화할까요? 기존 샘플/테스트/업로드 데이터를 비우고, 이후 새로 올리는 엑셀 정보만 표시됩니다.')) return
+    if (!confirm('정말 초기화합니다. 이 작업은 misu_members, misu_receivable_items, misu_payments, misu_deposits, misu_closures, misu_pending 데이터만 비웁니다.')) return
+    setLoading(true); setError(''); setResult(null); setPreview(null)
+    try {
+      const res = await api.resetMisuData()
+      setResult({inserted:0, updated:0, skipped:0, errors:[res.message || '초기화 완료']})
+      await reloadFromDb?.()
+    } catch (e) { setError(e.message) }
+    finally { setLoading(false) }
+  }
+
   async function doCommit() {
     if (!file) return alert('엑셀 파일을 먼저 선택하세요.')
     if (!confirm('미리보기 내용을 DB에 반영할까요? 기존 데이터 삭제 없이 추가/보강만 합니다.')) return
@@ -39,7 +51,7 @@ export default function ExcelImport({ reloadFromDb }) {
     <PageHead title="엑셀 업로드" desc="실제 협회 엑셀을 DB에 반영합니다. 미리보기 후 저장해야 반영됩니다." />
     <Card className="card-pad" style={{marginBottom:14}}>
       <div className="notice" style={{marginBottom:12}}>
-        삭제/초기화 없이 저장합니다. 먼저 <b>전체면허자현황</b>을 올린 뒤 <b>미수금명단</b>을 올리면 이름+차량번호로 매칭됩니다.
+        현재 화면은 샘플 없이 <b>DB에 저장된 실제 엑셀 데이터만</b> 표시합니다. 기존 테스트 저장분을 비우려면 먼저 초기화한 뒤 전체면허자현황 → 미수금명단 순서로 저장하세요.
       </div>
       <div className="filters">
         <select className="select" value={fileType} onChange={e=>{setFileType(e.target.value);setPreview(null);setResult(null)}}>
@@ -48,6 +60,7 @@ export default function ExcelImport({ reloadFromDb }) {
         <input className="input" type="file" accept=".xlsx,.xlsm,.xls,.csv" onChange={e=>{setFile(e.target.files?.[0]||null);setPreview(null);setResult(null)}} />
         <button className="btn" disabled={loading||!file} onClick={doPreview}>미리보기</button>
         <button className="btn green" disabled={loading||!file} onClick={doCommit}>DB 저장</button>
+        <button className="btn danger" disabled={loading} onClick={doReset}>기존 DB 초기화</button>
       </div>
       {loading && <p className="small">처리 중입니다...</p>}
       {error && <div className="notice" style={{borderColor:'#ffb4a8',background:'#fff0ed',color:'#b42318',marginTop:12}}>오류: {error}</div>}

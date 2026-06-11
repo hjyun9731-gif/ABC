@@ -16,13 +16,13 @@ from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError, DataError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..billing import charge_item, monthly_charge, next_month_ym
 from ..database import get_db
-from ..models import Deposit, Member, Payment, ReceivableItem
+from ..models import Closure, Deposit, Member, MemberHistory, Payment, Pending, ReceivableItem
 
 router = APIRouter(prefix="/api/import", tags=["import"])
 
@@ -447,6 +447,30 @@ def _find_member(db: Session, name: str, vehicle: str) -> Member | None:
     return None
 
 
+
+
+@router.post("/reset")
+def reset_misu_data(db: Session = Depends(get_db)):
+    """사용자 요청 시 misu_* 업무 데이터만 비운다.
+
+    기존 Railway/Postgres의 다른 테이블은 건드리지 않고,
+    이 프로그램에서 만든 misu_ 접두 테이블만 초기화한다.
+    """
+    counts = {}
+    # FK 때문에 자식 테이블부터 정리한다.
+    tables = [Payment, ReceivableItem, Closure, Deposit, Pending, MemberHistory, Member]
+    try:
+        for model in tables:
+            before = db.scalar(select(func.count()).select_from(model)) or 0
+            db.execute(delete(model))
+            counts[model.__tablename__] = before
+        db.commit()
+        return {"ok": True, "message": "misu_* 업무 데이터 초기화 완료", "deleted": counts}
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"초기화 실패: {str(exc)[:300]}") from exc
+
+
 @router.post("/preview")
 def preview_import(file_type: str = Form(...), file: UploadFile = File(...)):
     filename, rows = _read_excel(file, max_rows=300)
@@ -473,12 +497,56 @@ def commit_import(file_type: str = Form(...), file: UploadFile = File(...), db: 
     errors: list[str] = []
 
     if file_type in {"members", "license", "전체면허자현황"}:
+        # 같은 업로드 파일 안에서 아직 commit 되지 않은 신규 회원끼리도
+        # M00001 같은 PK가 중복되지 않도록 ID/관리번호를 메모리에서 선점한다.
+        existing_ids = set(str(x) for x in db.scalars(select(Member.id)).all() if x)
+        max_no = 0
+        for mid in existing_ids:
+            m = re.search(r"(\d+)$", mid)
+            if m:
+                max_no = max(max_no, int(m.group(1)))
+        next_no = max_no + 1
+        used_mgmt = set(str(x) for x in db.scalars(select(Member.mgmt_no)).all() if x)
+        pending_by_vehicle: dict[str, Member] = {}
+        pending_by_name_last4: dict[tuple[str, str], Member] = {}
+
+        def allocate_member_id() -> str:
+            nonlocal next_no
+            while True:
+                mid = f"M{next_no:05d}"
+                next_no += 1
+                if mid not in existing_ids:
+                    existing_ids.add(mid)
+                    return mid
+
+        def allocate_mgmt_no(base: str, fallback: str) -> str:
+            raw = (_clean(base) or fallback or "신00-000")[:16]
+            candidate = raw
+            if candidate not in used_mgmt:
+                used_mgmt.add(candidate)
+                return candidate
+            for i in range(2, 10000):
+                suffix = f"-{i}"
+                candidate = f"{raw[:16-len(suffix)]}{suffix}"
+                if candidate not in used_mgmt:
+                    used_mgmt.add(candidate)
+                    return candidate
+            candidate = f"{raw[:11]}-{len(used_mgmt)}"[:16]
+            used_mgmt.add(candidate)
+            return candidate
+
         for idx, row in enumerate(rows, start=1):
             payload = _member_payload(row, idx, columns, db)
             if not payload:
                 skipped += 1
                 continue
-            existing = _find_member(db, payload["name"], payload["vehicle_no"])
+            vehicle_key = payload.get("vehicle_no") or ""
+            name_last4_key = (payload.get("name") or "", _vehicle_last4(vehicle_key))
+            existing = pending_by_vehicle.get(vehicle_key) if vehicle_key else None
+            if not existing and name_last4_key[0] and name_last4_key[1]:
+                existing = pending_by_name_last4.get(name_last4_key)
+            if not existing:
+                existing = _find_member(db, payload["name"], payload["vehicle_no"])
             try:
                 if existing:
                     # 빈 값으로 기존 값을 지우지 않는다. 관리번호는 충돌 위험이 있어 기존 값 우선.
@@ -488,9 +556,14 @@ def commit_import(file_type: str = Form(...), file: UploadFile = File(...), db: 
                         setattr(existing, key, value)
                     updated += 1
                 else:
-                    payload["id"] = _next_member_id(db)
-                    payload["mgmt_no"] = _make_unique_mgmt_no(db, payload.get("mgmt_no") or payload["id"])
-                    db.add(Member(**payload))
+                    payload["id"] = allocate_member_id()
+                    payload["mgmt_no"] = allocate_mgmt_no(payload.get("mgmt_no") or "", payload["id"])
+                    member = Member(**payload)
+                    db.add(member)
+                    if vehicle_key:
+                        pending_by_vehicle[vehicle_key] = member
+                    if name_last4_key[0] and name_last4_key[1]:
+                        pending_by_name_last4[name_last4_key] = member
                     inserted += 1
                 if (inserted + updated) % 200 == 0:
                     db.commit()

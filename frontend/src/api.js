@@ -40,4 +40,5 @@ export const api = {
     const fd = new FormData(); fd.append('file_type', fileType); fd.append('file', file);
     return http('/import/commit', { method: 'POST', body: fd });
   },
+  resetMisuData: () => http('/import/reset', { method: 'POST' }),
 };

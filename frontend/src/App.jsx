@@ -36,16 +36,18 @@ export default function App() {
         setHealth('연결됨 · 실제 DB 데이터 표시 중')
         return true
       }
-      setHealth('연결됨 · DB 데이터 없음, 샘플데이터 표시 중')
+      setData(d => ({...d, members: []}))
+      setHealth('연결됨 · DB 데이터 없음, 엑셀 업로드 필요')
       return false
     }catch(e){
-      setHealth('백엔드 미연결 · 화면은 샘플데이터로 동작')
+      setData(d => ({...d, members: []}))
+      setHealth('백엔드 미연결 · 데이터 표시 불가')
       return false
     }
   }
 
   useEffect(() => {
-    api.health().then((d) => { setHealth(`연결됨 (${d.app})`); reloadFromDb() }).catch(() => setHealth('백엔드 미연결 · 화면은 샘플데이터로 동작'))
+    api.health().then((d) => { setHealth(`연결됨 (${d.app})`); reloadFromDb() }).catch(() => setHealth('백엔드 미연결 · 데이터 표시 불가'))
   }, [])
 
   const summary = useMemo(() => {
@@ -120,7 +122,7 @@ export default function App() {
       <div className="brand">미수금관리</div>
       <div className="brand-sub">강원 개인소형화물협회</div>
       <nav>{NAV.map(n=><button key={n.key} onClick={()=>navigate(n.key)} className={'nav-btn '+(view===n.key?'active':'')}>{n.label}{n.main?' · MAIN':''}</button>)}</nav>
-      <div className="health">백엔드: {health}<br/>현재 화면: 샘플데이터 기반<br/>엑셀 업로드 후 실제 DB 데이터로 전환됨</div>
+      <div className="health">백엔드: {health}<br/>현재 화면: 실제 DB 데이터만 표시<br/>엑셀 업로드 후 DB 저장해야 표시됨</div>
     </aside>
     <main className="main"><Screen {...screenProps}/></main>
   </div>
