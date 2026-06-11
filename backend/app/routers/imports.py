@@ -42,6 +42,7 @@ STANDARD_MEMBER_COLUMNS = [
 
 ARREARS_PREVIEW_COLUMNS = [
     "지역", "계정", "비고", "차량번호", "성명", "대수", "이월금",
+    "기준월", "미수금액",
     "1월 미수금", "2월 미수금", "3월 미수금", "4월 미수금", "5월 미수금", "6월 미수금",
     "7월 미수금", "8월 미수금", "9월 미수금", "10월 미수금", "11월 미수금", "12월 미수금",
 ]
@@ -289,6 +290,25 @@ def _iter_license_rows(file_bytes: bytes, preview_limit: int | None = None) -> l
     return rows
 
 
+def _latest_active_month(headers: list[str], rows_cache: list[tuple]) -> int:
+    """실제 입력된 마지막 월의 미수금 컬럼을 찾는다.
+
+    미수금 파일의 월별 미수금은 매월 말 누적 잔액이므로 모두 합산하면 안 된다.
+    """
+    month_indices: dict[int, int] = {}
+    for i, h in enumerate(headers):
+        m = re.search(r"(\d{1,2})월\s*미수금", _clean(h).replace(" ", ""))
+        if m:
+            month_indices[int(m.group(1))] = i
+    latest = 0
+    for month, idx in month_indices.items():
+        for row in rows_cache[:800]:
+            if idx < len(row) and _clean(row[idx]) not in {"", "-", "–", "—"}:
+                latest = max(latest, month)
+                break
+    return latest or max(month_indices.keys() or [0])
+
+
 def _iter_arrears_rows(file_bytes: bytes, preview_limit: int | None = None) -> list[dict[str, Any]]:
     wb = _read_workbook(file_bytes)
     if "2026년회비내역" not in wb.sheetnames:
@@ -309,12 +329,21 @@ def _iter_arrears_rows(file_bytes: bytes, preview_limit: int | None = None) -> l
         "차량번호": col_idx("차량번호"), "성명": col_idx("성명"), "대수": col_idx("대수"), "이월금": col_idx("이월금"),
     }
     month_cols = {month: col_idx(f"{month}월 미수금") for month in range(1, 13)}
+    raw_rows = list(ws.iter_rows(min_row=2, max_col=80, values_only=True))
+    latest_month = _latest_active_month(headers, raw_rows)
+    latest_idx = month_cols.get(latest_month)
+
     rows: list[dict[str, Any]] = []
-    for row in ws.iter_rows(min_row=2, max_col=80, values_only=True):
+    for row in raw_rows:
         vehicle = _clean(row[base_cols["차량번호"]]) if base_cols["차량번호"] is not None else ""
         name = _person_name(row[base_cols["성명"]]) if base_cols["성명"] is not None else ""
         if not _valid_vehicle(vehicle) or not name:
             continue
+        monthly_values: dict[str, int] = {}
+        for month in range(1, 13):
+            idx = month_cols.get(month)
+            monthly_values[f"{month}월 미수금"] = _money(row[idx]) if idx is not None and idx < len(row) else 0
+        current_amount = _money(row[latest_idx]) if latest_idx is not None and latest_idx < len(row) else 0
         out = {
             "지역": _clean(row[base_cols["지역"]]) if base_cols["지역"] is not None else "",
             "계정": _clean(row[base_cols["계정"]]) if base_cols["계정"] is not None else "",
@@ -323,15 +352,14 @@ def _iter_arrears_rows(file_bytes: bytes, preview_limit: int | None = None) -> l
             "성명": name,
             "대수": _clean(row[base_cols["대수"]]) if base_cols["대수"] is not None else "",
             "이월금": _money(row[base_cols["이월금"]]) if base_cols["이월금"] is not None else 0,
+            "기준월": f"2026-{latest_month:02d}" if latest_month else "2026-00",
+            "미수금액": current_amount,
+            **monthly_values,
         }
-        for month in range(1, 13):
-            idx = month_cols.get(month)
-            out[f"{month}월 미수금"] = _money(row[idx]) if idx is not None and idx < len(row) else 0
         rows.append(out)
         if preview_limit and len(rows) >= preview_limit:
             return rows
     return rows
-
 
 def _iter_deposit_rows(file_bytes: bytes, preview_limit: int | None = None) -> list[dict[str, Any]]:
     # 일반 통장거래내역은 형식이 다양하므로 pandas로 첫 시트 헤더 자동 추정
@@ -488,37 +516,37 @@ async def commit_import(file_type: str = Form(...), file: UploadFile = File(...)
     if file_type == "arrears":
         rows = _iter_arrears_rows(data, preview_limit=None)
         inserted = updated = skipped = 0
+        unmatched: list[dict[str, str]] = []
         for row in rows:
             member = _find_member_for_arrears(db, row["성명"], row["차량번호"])
             if not member:
                 skipped += 1
+                if len(unmatched) < 30:
+                    unmatched.append({"성명": row["성명"], "차량번호": row["차량번호"], "사유": "전체자명단에서 이름+차량번호 뒤4자리 매칭 실패"})
                 continue
-            created = 0
-            carry = _money(row.get("이월금"))
-            if carry > 0:
-                item = db.scalar(select(ReceivableItem).where(ReceivableItem.member_id == member.id, ReceivableItem.ym == "2026-00").limit(1))
-                if item:
-                    item.amount = carry; item.is_paid = False; updated += 1
-                else:
-                    db.add(ReceivableItem(member_id=member.id, ym="2026-00", charge_item=member.charge_item, amount=carry, is_paid=False)); inserted += 1
-                created += 1
-            for month in range(1, 13):
-                amt = _money(row.get(f"{month}월 미수금"))
-                if amt <= 0:
-                    continue
-                ym = f"2026-{month:02d}"
-                item = db.scalar(select(ReceivableItem).where(ReceivableItem.member_id == member.id, ReceivableItem.ym == ym).limit(1))
-                if item:
-                    item.amount = amt; item.is_paid = False; updated += 1
-                else:
-                    db.add(ReceivableItem(member_id=member.id, ym=ym, charge_item=member.charge_item, amount=amt, is_paid=False)); inserted += 1
-                created += 1
-            if created == 0:
+
+            # 중요: 월별 미수금은 누적 잔액이다.
+            # 이월금 + 1월 미수금 + 2월 미수금 ... 을 합산하면 금액이 틀어진다.
+            # 현재 미수금은 실제 입력된 마지막 월의 미수금액 1개만 저장한다.
+            amt = _money(row.get("미수금액"))
+            ym = row.get("기준월") or "2026-00"
+            if amt <= 0:
                 skipped += 1
+                continue
+
+            item = db.scalar(select(ReceivableItem).where(ReceivableItem.member_id == member.id, ReceivableItem.ym == ym).limit(1))
+            if item:
+                item.amount = amt
+                item.charge_item = member.charge_item
+                item.is_paid = False
+                updated += 1
+            else:
+                db.add(ReceivableItem(member_id=member.id, ym=ym, charge_item=member.charge_item, amount=amt, is_paid=False))
+                inserted += 1
             if (inserted + updated) % 500 == 0:
                 db.commit()
         db.commit()
-        return {"ok": True, "filename": file.filename, "type": "arrears", "inserted": inserted, "updated": updated, "skipped": skipped, "errors": []}
+        return {"ok": True, "filename": file.filename, "type": "arrears", "inserted": inserted, "updated": updated, "skipped": skipped, "errors": unmatched}
 
     if file_type == "deposits":
         rows = _iter_deposit_rows(data, preview_limit=None)
