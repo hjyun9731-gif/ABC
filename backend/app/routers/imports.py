@@ -32,7 +32,7 @@ SIGUN = [
     "양구군", "인제군", "고성군", "양양군",
 ]
 
-NAME_KEYS = ["성명", "이름", "대표자", "대표자명", "회원명", "사업자명", "성명(대표자)", "성명대표자"]
+NAME_KEYS = ["업체명 및 대표자", "업체명및대표자", "성명", "이름", "대표자", "대표자명", "회원명", "사업자명", "성명(대표자)", "성명대표자"]
 VEHICLE_KEYS = ["차량번호", "차량 번호", "차량", "차량등록번호", "자동차등록번호", "자동차 등록번호", "등록번호", "차량No", "차량NO"]
 PHONE_KEYS = ["휴대폰", "핸드폰", "전화번호", "연락처", "휴대전화", "휴대폰번호"]
 REGION_KEYS = ["지역", "시군", "관할", "주소", "공문주소", "주소지", "사용본거지"]
@@ -150,6 +150,59 @@ def _sigun_from_text(text: str) -> str:
         if short and short in text:
             return s
     return "미분류"
+
+
+def _is_region_marker(value: str) -> bool:
+    """전체면허자현황에서 지역 제목행(예: 춘천시)만 이름으로 오인하지 않도록 방지."""
+    v = _clean(value).replace(" ", "")
+    if not v:
+        return False
+    return any(v == s.replace(" ", "") or v == s[:-1].replace(" ", "") for s in SIGUN)
+
+
+def _prepare_member_rows(rows: list[dict[str, Any]], columns: list[str]) -> list[dict[str, Any]]:
+    """전체면허자현황은 한 업체/대표자 아래에 차량 여러 대가 이어지는 병합셀/빈셀 구조가 많다.
+
+    예) 첫 행에 업체명·주소만 있고, 다음 차량행은 업체명 칸이 비어 있는 경우가 많으므로
+    업체명/주소/전화번호/가입일자 같은 기준값은 위 행 값을 이어받게 한다.
+    단, '춘천시' 같은 지역 구분행은 대표자명으로 이어받지 않는다.
+    """
+    if not rows:
+        return rows
+    name_col = _find_col(columns, NAME_KEYS)
+    vehicle_col = _find_col(columns, VEHICLE_KEYS)
+    carry_cols: list[str] = []
+    for keys in (NAME_KEYS, REGION_KEYS, PHONE_KEYS, MGMT_KEYS, CERT_KEYS, JOIN_KEYS, MEMBER_TYPE_KEYS):
+        c = _find_col(columns, keys)
+        if c and c not in carry_cols:
+            carry_cols.append(c)
+    carry: dict[str, Any] = {}
+    prepared: list[dict[str, Any]] = []
+    for row in rows:
+        new = dict(row)
+        vehicle = _clean(new.get(vehicle_col)) if vehicle_col else ""
+        raw_name = _clean(new.get(name_col)) if name_col else ""
+
+        # 값이 있는 셀은 carry 갱신. 단, 지역 제목행은 이름 carry로 쓰지 않음.
+        for c in carry_cols:
+            val = _clean(new.get(c))
+            if not val:
+                continue
+            if c == name_col and _is_region_marker(val) and not vehicle:
+                continue
+            carry[c] = new.get(c)
+
+        # 빈 셀은 바로 위 유효값으로 보강한다.
+        # 차량번호가 있는 행은 실제 회원/차량 행일 가능성이 높으므로 대표자·주소 등을 반드시 이어받는다.
+        for c in carry_cols:
+            if not _clean(new.get(c)) and c in carry:
+                new[c] = carry[c]
+
+        # 그래도 이름이 지역명뿐이면 저장 대상에서 제외되도록 비워 둔다.
+        if name_col and _is_region_marker(_clean(new.get(name_col))) and not vehicle:
+            new[name_col] = ""
+        prepared.append(new)
+    return prepared
 
 
 def _vehicle_last4(vehicle: str) -> str:
@@ -497,6 +550,7 @@ def commit_import(file_type: str = Form(...), file: UploadFile = File(...), db: 
     errors: list[str] = []
 
     if file_type in {"members", "license", "전체면허자현황"}:
+        rows = _prepare_member_rows(rows, columns)
         # 같은 업로드 파일 안에서 아직 commit 되지 않은 신규 회원끼리도
         # M00001 같은 PK가 중복되지 않도록 ID/관리번호를 메모리에서 선점한다.
         existing_ids = set(str(x) for x in db.scalars(select(Member.id)).all() if x)

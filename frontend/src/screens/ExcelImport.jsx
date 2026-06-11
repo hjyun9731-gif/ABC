@@ -71,9 +71,9 @@ export default function ExcelImport({ reloadFromDb }) {
       <div className="tabs">
         <Badge tone="green">추가 {result.inserted || 0}</Badge>
         <Badge tone="blue">갱신 {result.updated || 0}</Badge>
-        <Badge tone="orange">건너뜀 {result.skipped || 0}</Badge>
+        <Badge tone="orange">건너뜀/빈행 {result.skipped || 0}</Badge>
       </div>
-      {result.errors?.length ? <pre className="small">{result.errors.join('\n')}</pre> : <p className="small">오류 없음</p>}
+      {result.errors?.length ? <pre className="small">{result.errors.join('\n')}</pre> : <p className="small">오류 없음 · 건너뜀은 빈 행, 차량번호 없는 행, 저장 대상이 아닌 행입니다.</p>}
     </Card>}
 
     {preview && <Card>
