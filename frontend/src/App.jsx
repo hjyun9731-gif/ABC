@@ -30,17 +30,18 @@ export default function App() {
 
   async function reloadFromDb(){
     try{
-      const members = await api.listMembers({size: 5000})
-      if(Array.isArray(members) && members.length){
-        setData(d => ({...d, members}))
-        setHealth('연결됨 · 실제 DB 데이터 표시 중')
-        return true
-      }
-      setData(d => ({...d, members: []}))
-      setHealth('연결됨 · DB 데이터 없음, 엑셀 업로드 필요')
-      return false
+      const [members, closures, pending, deposits, payments] = await Promise.all([
+        api.listMembers({size: 10000}),
+        api.listClosures().catch(()=>[]),
+        api.listPending().catch(()=>[]),
+        api.listDeposits({size: 5000}).catch(()=>[]),
+        api.listPayments({size: 5000}).catch(()=>[]),
+      ])
+      setData(d => ({...d, members: Array.isArray(members)?members:[], closures: closures||[], pending: pending||[], deposits: deposits||[], payments: payments||[]}))
+      setHealth(Array.isArray(members) && members.length ? '연결됨 · 실제 DB 데이터 표시 중' : '연결됨 · DB 데이터 없음, 엑셀 업로드 필요')
+      return true
     }catch(e){
-      setData(d => ({...d, members: []}))
+      setData(d => ({...d, members: [], closures: [], pending: [], deposits: [], payments: []}))
       setHealth('백엔드 미연결 · 데이터 표시 불가')
       return false
     }
@@ -72,46 +73,29 @@ export default function App() {
 
   function navigate(nextView, nextPreset=null){ setView(nextView); setPreset(nextPreset) }
 
-  function saveMemo(memberId, memo){
-    setData(d => ({...d, members: d.members.map(m => m.id===memberId ? {...m, memo, updatedAt:'방금'} : m)}))
+  async function saveMemo(memberId, memo){
+    try{ await api.updateMember(memberId,{memo}); await reloadFromDb() }
+    catch(e){ alert(e.message || '메모 저장 실패') }
   }
 
-  function applyPayment(memberId, amount, method='직접수납'){
-    let created=[]
-    setData(d => {
-      const members = d.members.map(m => {
-        if(m.id!==memberId) return m
-        let remain = Number(amount)||0
-        const arrears = (m.arrears||[]).map(a => {
-          if(!a.paid && remain >= a.amount){ remain -= a.amount; created.push({member:m, item:a}); return {...a, paid:true} }
-          return a
-        })
-        const open = arrears.filter(a=>!a.paid)
-        return {...m, arrears, arrearsMonths: open.length, totalArrears: open.reduce((s,a)=>s+a.amount,0), lastPaymentYm: created.length?created[created.length-1].item.label:m.lastPaymentYm, updatedAt:'방금'}
-      })
-      const payments = [...d.payments, ...created.map((c, idx)=>({id:'PNEW'+Date.now()+idx, memberId:c.member.id, name:c.member.name, vehicleNo:c.member.vehicleNo, paidForYm:c.item.label, chargeItem:c.item.item, amount:c.item.amount, method, paidDate:new Date().toISOString().slice(0,10)}))]
-      return {...d, members, payments}
-    })
+  async function applyPayment(memberId, amount, method='직접수납'){
+    try{ await api.applyPayment(memberId,{amount:Number(amount)||0, method}); await reloadFromDb() }
+    catch(e){ alert(e.message || '수납 반영 실패') }
   }
 
-  function registerClosure(memberId, payload){
-    setData(d => {
-      const member = d.members.find(m=>m.id===memberId)
-      if(!member) return d
-      const type = payload.type || '폐업'
-      const updatedMember = {...member, status:type, memo:payload.content || member.memo, updatedAt:'방금'}
-      const closure = {id:'CNEW'+Date.now(), memberId, name:member.name, vehicleNo:member.vehicleNo, sigun:member.sigun, type, processDate:payload.processDate || new Date().toISOString().slice(0,10), docNo:payload.docNo||'', content:payload.content||'미수금명단에서 처리', unpaidBalance:member.totalArrears, notifyLater:member.totalArrears>0, memo:payload.memo||''}
-      return {...d, members:d.members.map(m=>m.id===memberId?updatedMember:m), closures:[closure,...d.closures]}
-    })
+  async function registerClosure(memberId, payload){
+    try{ await api.registerClosure(memberId,{type:payload.type, doc_no:payload.docNo || payload.doc_no || '', content:payload.content || '', notify_later:payload.notify_later || false, process_date:payload.processDate || new Date().toISOString().slice(0,10)}); await reloadFromDb() }
+    catch(e){ alert(e.message || '폐업 등록 실패') }
   }
 
-  function matchDeposit(depositId, memberId){
-    const deposit = data.deposits.find(x=>x.id===depositId)
-    if(!deposit) return
-    applyPayment(memberId, deposit.amount, '통장매칭')
-    setData(d => ({...d, deposits:d.deposits.map(x=>x.id===depositId?{...x,status:'매칭완료',candidateId:memberId}:x)}))
+  async function matchDeposit(depositId, memberId){
+    try{ await api.matchDeposit(depositId,{member_id:memberId}); await reloadFromDb() }
+    catch(e){ alert(e.message || '통장매칭 실패') }
   }
-  function excludeDeposit(depositId){ setData(d=>({...d, deposits:d.deposits.map(x=>x.id===depositId?{...x,status:'제외'}:x)})) }
+  async function excludeDeposit(depositId){
+    try{ await api.excludeDeposit(depositId); await reloadFromDb() }
+    catch(e){ alert(e.message || '입금 제외 실패') }
+  }
   function addPending(payload){ setData(d=>({...d,pending:[{...payload,id:'NNEW'+Date.now(),step:'예정자 등록',note:payload.note||''},...d.pending]})) }
 
   const screenProps = {data, summary, navigate, preset, setPreset, saveMemo, applyPayment, registerClosure, matchDeposit, excludeDeposit, addPending, reloadFromDb}

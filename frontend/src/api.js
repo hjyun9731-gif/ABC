@@ -31,6 +31,7 @@ export const api = {
   excludeDeposit: (id) => http(`/deposits/${id}/exclude`, { method: 'POST' }),
   listClosures: () => http('/closures'),
   listPending: () => http('/pending'),
+  listPayments: (params = {}) => http(`/payments${qs(params)}`),
   dashboardSummary: () => http('/dashboard/summary'),
   importPreview: (fileType, file) => {
     const fd = new FormData(); fd.append('file_type', fileType); fd.append('file', file);

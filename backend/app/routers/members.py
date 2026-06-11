@@ -66,11 +66,11 @@ def _member_dict(member: Member, detail: bool = False) -> dict:
     }
     if detail:
         out["receivable_items"] = [
-            {"id": x.id, "ym": x.ym, "label": x.ym, "charge_item": x.charge_item, "item": x.charge_item, "amount": x.amount, "is_paid": x.is_paid, "paid": x.is_paid}
+            {"id": x.id, "ym": x.ym, "label": f"현재잔액({x.ym})", "charge_item": x.charge_item, "item": x.charge_item, "amount": x.amount, "is_paid": x.is_paid, "paid": x.is_paid}
             for x in sorted(member.receivable_items, key=lambda x: x.ym)
         ]
         out["arrears"] = [
-            {"id": x.id, "ym": x.ym, "label": x.ym, "charge_item": x.charge_item, "item": x.charge_item, "amount": x.amount, "is_paid": x.is_paid, "paid": x.is_paid}
+            {"id": x.id, "ym": x.ym, "label": f"현재잔액({x.ym})", "charge_item": x.charge_item, "item": x.charge_item, "amount": x.amount, "is_paid": x.is_paid, "paid": x.is_paid}
             for x in sorted(member.receivable_items, key=lambda x: x.ym)
         ]
         out["payments"] = [
@@ -79,7 +79,7 @@ def _member_dict(member: Member, detail: bool = False) -> dict:
         ]
     else:
         out["arrears"] = [
-            {"id": x.id, "ym": x.ym, "label": x.ym, "item": x.charge_item, "amount": x.amount, "paid": x.is_paid}
+            {"id": x.id, "ym": x.ym, "label": f"현재잔액({x.ym})", "item": x.charge_item, "amount": x.amount, "paid": x.is_paid}
             for x in open_items[:12]
         ]
     return out
@@ -153,17 +153,25 @@ def apply_payment(member_id: str, payload: PaymentApply, db: Session = Depends(g
     if remain <= 0:
         raise HTTPException(status_code=400, detail="수납액은 0원보다 커야 합니다.")
     paid_count = 0
+    applied = 0
     for item in _open_items(member):
-        if remain < item.amount:
+        if remain <= 0:
             break
-        remain -= item.amount
-        item.is_paid = True
-        db.add(Payment(member_id=member.id, paid_for_ym=item.ym, charge_item=item.charge_item, amount=item.amount, method=payload.method, paid_date=payload.paid_date or date.today(), deposit_id=payload.deposit_id))
+        pay_amount = min(remain, item.amount)
+        if pay_amount <= 0:
+            continue
+        db.add(Payment(member_id=member.id, paid_for_ym=item.ym, charge_item=item.charge_item, amount=pay_amount, method=payload.method, paid_date=payload.paid_date or date.today(), deposit_id=payload.deposit_id))
+        applied += pay_amount
+        remain -= pay_amount
+        if pay_amount >= item.amount:
+            item.is_paid = True
+            paid_count += 1
+        else:
+            item.amount -= pay_amount
         member.last_payment_ym = item.ym
-        paid_count += 1
-    db.add(MemberHistory(member_id=member.id, content=f"수납 반영 {payload.amount:,}원 / {paid_count}개월", actor="system"))
+    db.add(MemberHistory(member_id=member.id, content=f"수납 반영 {applied:,}원 / 미수항목 {paid_count}건 완납", actor="system"))
     db.commit()
-    return {"ok": True, "paid_count": paid_count, "remain": remain, "member": get_member(member_id, db)}
+    return {"ok": True, "paid_count": paid_count, "applied": applied, "remain": remain, "member": get_member(member_id, db)}
 
 
 @router.post("/{member_id}/closure")

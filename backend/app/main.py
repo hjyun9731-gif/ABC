@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import get_settings
 from .database import Base, engine
-from .routers import closures, dashboard, deposits, imports, members, pending
+from .routers import closures, dashboard, deposits, imports, members, pending, payments
 
 settings = get_settings()
 
@@ -31,7 +31,7 @@ app.add_middleware(
 )
 
 # API 라우터
-for r in (members, deposits, closures, pending, dashboard, imports):
+for r in (members, deposits, closures, pending, dashboard, imports, payments):
     app.include_router(r.router)
 
 

@@ -73,7 +73,7 @@ export default function ExcelImport({ reloadFromDb }) {
         <Badge tone="blue">갱신 {result.updated || 0}</Badge>
         <Badge tone="orange">건너뜀/빈행 {result.skipped || 0}</Badge>
       </div>
-      {result.errors?.length ? <pre className="small">{result.errors.join('\n')}</pre> : <p className="small">오류 없음 · 건너뜀은 빈 행, 차량번호 없는 행, 저장 대상이 아닌 행입니다.</p>}
+      {result.errors?.length ? <pre className="small">{result.errors.map(e=>typeof e==='string'?e:JSON.stringify(e)).join('\n')}</pre> : <p className="small">오류 없음 · 건너뜀은 빈 행, 차량번호 없는 행, 저장 대상이 아닌 행입니다.</p>}
     </Card>}
 
     {preview && <Card>
@@ -84,7 +84,7 @@ export default function ExcelImport({ reloadFromDb }) {
         {preview.raw_columns?.length ? <p className="small">원본 인식 컬럼: {preview.raw_columns.slice(0,20).join(' · ')}{preview.raw_columns.length>20?' ...':''}</p> : null}
         <div className="tabs" style={{marginBottom:10}}>{preview.columns?.slice(0,24).map(c=><Badge key={c} tone="gray">{c}</Badge>)}</div>
       </div>
-      <div className="table-wrap"><table className="table"><thead><tr>{preview.columns?.slice(0,13).map(c=><th key={c}>{c}</th>)}</tr></thead><tbody>{preview.sample?.map((r,i)=><tr key={i}>{preview.columns?.slice(0,13).map(c=><td key={c}>{String(r[c] ?? '')}</td>)}</tr>)}</tbody></table></div>
+      <div className="table-wrap"><table className="table"><thead><tr>{preview.columns?.slice(0,18).map(c=><th key={c}>{c}</th>)}</tr></thead><tbody>{preview.sample?.map((r,i)=><tr key={i}>{preview.columns?.slice(0,18).map(c=><td key={c}>{String(r[c] ?? '')}</td>)}</tr>)}</tbody></table></div>
     </Card>}
   </div>
 }
